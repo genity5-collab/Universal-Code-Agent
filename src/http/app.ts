@@ -9,9 +9,10 @@ import { SessionManager, parseCookies } from "../auth/session.js";
 import { GithubTokenVault } from "../auth/tokenvault.js";
 import * as GHO from "../github/oauth.js";
 import { GitHubClient } from "../github/client.js";
-import { buildMcpServer } from "../mcp/server.js";
+import { buildMcpServer, allTools } from "../mcp/server.js";
+import { CodespaceBroker } from "../codespace/broker.js";
 import { ApprovalService, AuditLog, RateLimiter } from "../mcp/services.js";
-import { TOOLS, type ToolDeps } from "../mcp/tools.js";
+import { type ToolDeps } from "../mcp/tools.js";
 import * as R from "../exec/runner.js";
 import { evaluateCommand } from "../exec/policy.js";
 import { safeSegment, redact } from "../util/paths.js";
@@ -21,7 +22,7 @@ const WEB_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.
 const MIME: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".webmanifest": "application/manifest+json", ".svg": "image/svg+xml" };
 
 export interface AppOptions { githubApiBase?: string; githubWebBase?: string; fetchImpl?: typeof fetch; webDir?: string }
-export interface App { server: http.Server; auth: AuthorizationServer; sessions: SessionManager; approvals: ApprovalService; deps: ToolDeps; close(): Promise<void> }
+export interface App { broker: CodespaceBroker; server: http.Server; auth: AuthorizationServer; sessions: SessionManager; approvals: ApprovalService; deps: ToolDeps; close(): Promise<void> }
 
 function readBody(req: http.IncomingMessage, limit = 2_000_000): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -42,7 +43,8 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
   const approvals = new ApprovalService();
   const audit = new AuditLog(config.dataDir);
   const limiter = new RateLimiter(config.rateLimitPerMin);
-  const deps: ToolDeps = { config, approvals, audit, limiter, githubBaseUrl: opts.githubApiBase, fetchImpl: opts.fetchImpl };
+  const broker = new CodespaceBroker();
+  const deps: ToolDeps = { broker, publicBaseUrl: config.baseUrl, config, approvals, audit, limiter, githubBaseUrl: opts.githubApiBase, fetchImpl: opts.fetchImpl };
   const secure = config.baseUrl.startsWith("https://");
   const fetchImpl = opts.fetchImpl ?? fetch;
   const webDir = opts.webDir ?? WEB_DIR;
@@ -151,6 +153,60 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
       } catch (e: any) { return send(res, 502, `<h1>GitHub login failed</h1><p>${escHtml(redact(String(e?.message ?? e)))}</p>`); }
     }
 
+
+    // ---- Codespace agent endpoints (agent -> server; Bearer pairing token) ----
+    if (p === "/agent/install.sh" && m === "GET") {
+      const script = `#!/usr/bin/env bash
+set -euo pipefail
+# Universal Code Agent: installs the Codespace agent. Needs: node >= 18, curl.
+: "\${UCA_SERVER:?UCA_SERVER missing}"; : "\${UCA_CLAIM:?UCA_CLAIM missing}"
+command -v node >/dev/null || { echo "node is required in this Codespace" >&2; exit 1; }
+DIR="\${UCA_HOME:-$HOME/.uca-agent}"; mkdir -p "$DIR"; chmod 700 "$DIR"
+curl -fsSL "$UCA_SERVER/agent/uca-agent.mjs" -o "$DIR/uca-agent.mjs"
+RESP="$(curl -fsS -X POST -H 'content-type: application/json' -d "{\\"claim\\":\\"$UCA_CLAIM\\"}" "$UCA_SERVER/agent/claim")"
+TOKEN="$(printf '%s' "$RESP" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).token||"")}catch{}})')"
+[ -n "$TOKEN" ] || { echo "Claim rejected (expired or already used). Run codespaces_attach again." >&2; exit 1; }
+umask 077
+printf 'UCA_SERVER=%s\\nUCA_TOKEN=%s\\n' "$UCA_SERVER" "$TOKEN" > "$DIR/env"
+cat > "$DIR/start.sh" <<'EOS'
+#!/usr/bin/env bash
+DIR="\${UCA_HOME:-$HOME/.uca-agent}"
+pgrep -f "$DIR/uca-agent.mjs" >/dev/null && exit 0
+set -a; . "$DIR/env"; set +a
+nohup node "$DIR/uca-agent.mjs" --root "\${UCA_ROOT:-\${CODESPACE_VSCODE_FOLDER:-$PWD}}" >> "$DIR/agent.log" 2>&1 &
+EOS
+chmod 700 "$DIR/start.sh"
+grep -q "uca-agent/start.sh" "$HOME/.bashrc" 2>/dev/null || echo '[ -x "$HOME/.uca-agent/start.sh" ] && "$HOME/.uca-agent/start.sh" >/dev/null 2>&1' >> "$HOME/.bashrc"
+"$DIR/start.sh"
+echo "UCA agent started. Log: $DIR/agent.log"
+`;
+      res.writeHead(200, { ...secHeaders, "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "no-store" });
+      return void res.end(script);
+    }
+    if (p === "/agent/uca-agent.mjs" && m === "GET") {
+      const f = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../agent/uca-agent.mjs");
+      if (!fs.existsSync(f)) return send(res, 404, { error: "agent_not_found" });
+      res.writeHead(200, { ...secHeaders, "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" });
+      return void res.end(fs.readFileSync(f));
+    }
+    if (p === "/agent/claim" && m === "POST") {
+      if (!sessions.loginLimiter.hit("claim:" + ip(req))) return send(res, 429, { error: "too_many_attempts" });
+      let b: any; try { b = JSON.parse((await readBody(req, 10_000)) || "{}"); } catch { return send(res, 400, { error: "bad_request" }); }
+      const r = broker.redeemClaim(String(b.claim ?? ""));
+      return r ? send(res, 200, { token: r.token, codespace: r.codespace }) : send(res, 403, { error: "claim_invalid_or_expired" });
+    }
+    if (p === "/agent/hello" || p === "/agent/next" || p === "/agent/result") {
+      if (m !== "POST") return send(res, 405, { error: "method_not_allowed" });
+      const bearer = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization ?? ""))?.[1];
+      const ag = broker.authenticate(bearer);
+      if (!ag) return send(res, 401, { error: "invalid_agent_token" });
+      let b: any = {}; try { const raw = await readBody(req, 8_000_000); b = raw ? JSON.parse(raw) : {}; } catch { return send(res, 400, { error: "bad_request" }); }
+      if (p === "/agent/hello") { broker.hello(ag.key, b.info && typeof b.info === "object" ? b.info : {}); return send(res, 200, { ok: true }); }
+      if (p === "/agent/next") { const job = await broker.next(ag.key, 25_000); return job ? send(res, 200, { job }) : send(res, 200, { job: null }); }
+      const okDone = broker.complete(ag.key, String(b.jobId ?? ""), b.result && typeof b.result === "object" ? b.result : { ok: false, error: "empty result" });
+      return send(res, okDone ? 200 : 404, { ok: okDone });
+    }
+
     // ---- MCP endpoint (Bearer token) ----
     if (p === "/mcp") {
       const a = auth.authorizeRequest({ headers: req.headers });
@@ -216,11 +272,11 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
       if (route === "/grants") return send(res, 200, { grants: auth.listGrants(ctx.userId) });
       if ((mm = /^\/grants\/([^/]+)\/revoke$/.exec(route)) && m === "POST") return send(res, 200, { revoked: auth.revokeGrant(ctx.userId, decodeURIComponent(mm[1])) });
       if (route === "/revoke-all" && m === "POST") return send(res, 200, { revoked: auth.revokeAllForUser(ctx.userId) });
-      if (route === "/tools") return send(res, 200, { tools: TOOLS.map((t) => ({ name: t.name, scope: t.scope, description: t.description })) });
+      if (route === "/tools") return send(res, 200, { tools: allTools(deps).map((t) => ({ name: t.name, scope: t.scope, description: t.description })) });
       return send(res, 404, { error: "not_found" });
     } catch (e: any) { return send(res, e?.status && e.status < 600 ? e.status : 500, { error: redact(String(e?.message ?? e)) }); }
   }
 
   const server = http.createServer((req, res) => { handle(req, res).catch((e: any) => { if (!res.headersSent) send(res, e?.status ?? 500, { error: redact(String(e?.message ?? "internal_error")) }); else res.end(); }); });
-  return { server, auth, sessions, approvals, deps, close: () => new Promise<void>((r) => server.close(() => r())) };
+  return { broker, server, auth, sessions, approvals, deps, close: () => new Promise<void>((r) => server.close(() => r())) };
 }

@@ -16,6 +16,8 @@ import type { ApprovalService, AuditLog, RateLimiter } from "./services.js";
 
 export type ToolScope = "mcp:read" | "mcp:write" | "mcp:exec";
 export interface ToolDeps {
+  broker?: import("../codespace/broker.js").CodespaceBroker;
+  publicBaseUrl?: string;
   config: Config;
   approvals: ApprovalService;
   audit: AuditLog;
@@ -253,7 +255,7 @@ export const TOOLS: ToolDef[] = [
   { name: "codespaces_delete", title: "Delete codespace", description: "Delete a Codespace. Requires approval.", scope: "mcp:write", readOnly: false, destructive: true, shape: { name: z.string() },
     handler: async (a, c, d) => { needApproval(c, d, "codespaces_delete", `Delete codespace ${a.name}`); return cs(c, d).deleteCodespace(a.name); } },
   { name: "codespaces_export", title: "Export codespace changes", description: "Export a Codespace to a branch.", scope: "mcp:write", readOnly: false, shape: { name: z.string() }, handler: (a, c, d) => cs(c, d).exportCodespace(a.name) },
-  { name: "codespaces_run_command", title: "Run command in codespace", description: "Not supported by the public REST API; returns how to do it with gh codespace ssh.", scope: "mcp:exec", readOnly: true, shape: { name: z.string(), command: z.string() }, handler: (a, c, d) => cs(c, d).runCommandViaSsh(a.name, a.command) },
+  { name: "codespaces_run_command", title: "Run command in codespace", description: "Legacy: only returns how to run a command with `gh codespace ssh`. To actually run commands in a Codespace, attach it with codespaces_attach and use cs_exec.", scope: "mcp:exec", readOnly: true, shape: { name: z.string(), command: z.string() }, handler: (a, c, d) => cs(c, d).runCommandViaSsh(a.name, a.command) },
 ];
 
 /** Execute a tool with rate limiting, audit and uniform error mapping. */

@@ -11,6 +11,12 @@ Includes a **mobile-friendly dashboard** (repos, editor, tasks, terminal, approv
 - **Per-user isolation**: separate workspace directory, separate encrypted GitHub token, audit log.
 - Also runs locally over **stdio** (no OAuth).
 
+## Use a GitHub Codespace as the AI's Linux VM
+
+Attach a Codespace and the AI runs real bash, file edits, git and tests inside it (`cs_exec`, `cs_read_file`, `cs_write_file`, `cs_git`, ...).
+A small agent inside the Codespace connects out to this server, so no inbound ports are needed. Setup is one pasted command; see [docs/codespaces.md](docs/codespaces.md),
+including the security model and what has not been verified against live GitHub.
+
 ## Quick start
 ```bash
 npm ci && npm run build
