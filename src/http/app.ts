@@ -7,6 +7,10 @@ import { fileURLToPath } from "node:url";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Config } from "../util/config.js";
 import type { AuthStore } from "../auth/store.js";
+import { InstaBoxManager, INSTABOX_SPEC } from "../instabox/client.js";
+import { ActivityFeed } from "../instabox/activity.js";
+import { vmPath, WORKSPACE_DIR, MAX_WORKSPACE_BYTES } from "../instabox/tools.js";
+import { shq } from "../instabox/client.js";
 import { AuthorizationServer } from "../auth/oauth.js";
 import { SessionManager, parseCookies } from "../auth/session.js";
 import { GithubTokenVault } from "../auth/tokenvault.js";
@@ -27,8 +31,8 @@ import type { UserContext } from "../types.js";
 const WEB_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../web");
 const MIME: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".webmanifest": "application/manifest+json", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon", ".json": "application/json; charset=utf-8", ".txt": "text/plain; charset=utf-8", ".woff2": "font/woff2" };
 
-export interface AppOptions { githubApiBase?: string; githubWebBase?: string; fetchImpl?: typeof fetch; webDir?: string; mirror?: AuthMirror | null }
-export interface App { mirror: AuthMirror | null; store: AuthStore; pvault: ProviderVault; broker: CodespaceBroker; server: http.Server; auth: AuthorizationServer; sessions: SessionManager; approvals: ApprovalService; deps: ToolDeps; close(): Promise<void> }
+export interface AppOptions { instaboxBaseUrl?: string; githubApiBase?: string; githubWebBase?: string; fetchImpl?: typeof fetch; webDir?: string; mirror?: AuthMirror | null }
+export interface App { mirror: AuthMirror | null; vm: InstaBoxManager; feed: ActivityFeed; store: AuthStore; pvault: ProviderVault; broker: CodespaceBroker; server: http.Server; auth: AuthorizationServer; sessions: SessionManager; approvals: ApprovalService; deps: ToolDeps; close(): Promise<void> }
 
 function readBody(req: http.IncomingMessage, limit = 2_000_000): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -50,10 +54,12 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
   const vault = new GithubTokenVault(store);
   const approvals = new ApprovalService();
   const audit = new AuditLog(config.dataDir);
+  const feed = new ActivityFeed();
   const limiter = new RateLimiter(config.rateLimitPerMin);
   const broker = new CodespaceBroker();
   const pvault = new ProviderVault();
-  const deps: ToolDeps = { vault: pvault, broker, publicBaseUrl: config.baseUrl, config, approvals, audit, limiter, githubBaseUrl: opts.githubApiBase, fetchImpl: opts.fetchImpl };
+  const vm = new InstaBoxManager(pvault, opts.fetchImpl ?? fetch, opts.instaboxBaseUrl, { pollMs: (opts as any).instaboxPollMs });
+  const deps: ToolDeps = { vm, feed, vault: pvault, broker, publicBaseUrl: config.baseUrl, config, approvals, audit, limiter, githubBaseUrl: opts.githubApiBase, fetchImpl: opts.fetchImpl };
   const secure = config.baseUrl.startsWith("https://");
   const fetchImpl = opts.fetchImpl ?? fetch;
   const webDir = opts.webDir ?? WEB_DIR;
@@ -369,6 +375,34 @@ echo "UCA agent started. Log: $DIR/agent.log"
         const c = new CodespacesClient(ghc()); const r: any = mm[2] === "start" ? await c.startCodespace(mm[1]) : await c.stopCodespace(mm[1]); return send(res, 200, { ok: true, state: r?.state ?? null });
       }
       // ---- provider keys: the USER pastes a key here (never in chat). Memory only. The AI never sees it. ----
+      // ---- VM + Workspace (everything the AI does happens in the user's VM) ----
+      if (route === "/vm" && m === "GET") { const st = vm.status(ctx.userId); return send(res, 200, { ...st, workspace: WORKSPACE_DIR, limitBytes: MAX_WORKSPACE_BYTES }); }
+      if (route === "/vm/start" && m === "POST") { try { const r = await vm.start(ctx.userId); feed.add(ctx.userId, { tool: "vm_start", kind: "vm", summary: "VM started", ok: true }); return send(res, 200, { ok: true, ...vm.status(ctx.userId), machineId: r.machineId }); } catch (e: any) { return send(res, 400, { error: pvault.scrubAll(ctx.userId, String(e?.message ?? e)) }); } }
+      if (route === "/vm/stop" && m === "POST") { const r = await vm.stop(ctx.userId); feed.add(ctx.userId, { tool: "vm_stop", kind: "vm", summary: "VM stopped", ok: true }); return send(res, 200, { stopped: r }); }
+      if (route === "/activity" && m === "GET") { const since = Number(url.searchParams.get("since") ?? 0) || 0; return send(res, 200, { items: feed.list(ctx.userId, since), vm: vm.status(ctx.userId) }); }
+      if (route === "/activity/stream" && m === "GET") {
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive", ...secHeaders });
+        res.write(`data: ${JSON.stringify({ hello: true, items: feed.list(ctx.userId, 0, 50) })}\n\n`);
+        const off = feed.subscribe(ctx.userId, (a) => res.write(`data: ${JSON.stringify(a)}\n\n`)); const ka = setInterval(() => res.write(": ka\n\n"), 20_000);
+        req.on("close", () => { off(); clearInterval(ka); }); return;
+      }
+      if (route === "/workspace/files" && m === "GET") {
+        try { const dir = vmPath(url.searchParams.get("path") ?? "."); const r = await vm.exec(ctx.userId, `mkdir -p ${WORKSPACE_DIR}; find ${shq(dir)} -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%T@\\t%f\\n' | sort -t$'\\t' -k1,1r -k4 | head -500; echo ---; du -sb ${WORKSPACE_DIR} | cut -f1`);
+          const [list, used] = r.stdout.split("\n---\n"); const entries = list.split("\n").filter(Boolean).map((l) => { const [t, sz, mt, ...nm] = l.split("\t"); return { name: nm.join("\t"), type: t === "d" ? "directory" : "file", size: Number(sz), modified: Math.round(Number(mt) * 1000) }; });
+          return send(res, 200, { path: dir.slice(WORKSPACE_DIR.length + 1) || ".", entries, usedBytes: Number(String(used).trim()) || 0, limitBytes: MAX_WORKSPACE_BYTES });
+        } catch (e: any) { return send(res, e?.name === "NoVmError" || /VM|key/.test(String(e?.message)) ? 409 : 400, { error: String(e?.message ?? e).slice(0, 300) }); }
+      }
+      if (route === "/workspace/download" && m === "GET") {
+        try { const rel = url.searchParams.get("path") ?? ""; const p = vmPath(rel); if (p === WORKSPACE_DIR) return send(res, 400, { error: "Choose a file or folder." });
+          const isDir = (await vm.exec(ctx.userId, `test -d ${shq(p)} && echo d || echo f`)).stdout.trim() === "d"; const name = p.split("/").pop()!.replace(/[^A-Za-z0-9._-]/g, "_");
+          if (isDir) { const sz = Number((await vm.exec(ctx.userId, `du -sb ${shq(p)} | cut -f1`)).stdout.trim()); if (sz > MAX_WORKSPACE_BYTES) return send(res, 413, { error: "Folder too large." }); if (sz > 40 * 1024 * 1024) return send(res, 413, { error: "Folder over 40 MB: download files individually or ask the AI to split it." });
+            const z = await vm.exec(ctx.userId, `cd ${shq(p)}/.. && (command -v zip >/dev/null && zip -qr - ${shq(p.split("/").pop()!)} | base64 -w0 || tar czf - ${shq(p.split("/").pop()!)} | base64 -w0)`, { timeoutSec: 120 }); const isZip = (await vm.exec(ctx.userId, "command -v zip >/dev/null && echo y || echo n")).stdout.trim() === "y";
+            const buf = Buffer.from(z.stdout.trim(), "base64"); feed.add(ctx.userId, { tool: "download", kind: "read", summary: `Downloaded folder ${rel}`, ok: true, bytes: buf.length });
+            res.writeHead(200, { "content-type": isZip ? "application/zip" : "application/gzip", "content-disposition": `attachment; filename="${name}.${isZip ? "zip" : "tar.gz"}"`, "content-length": buf.length, ...secHeaders }); return void res.end(buf); }
+          const buf = await vm.readFile(ctx.userId, p, 40 * 1024 * 1024); feed.add(ctx.userId, { tool: "download", kind: "read", summary: `Downloaded ${rel}`, ok: true, bytes: buf.length });
+          res.writeHead(200, { "content-type": "application/octet-stream", "content-disposition": `attachment; filename="${name}"`, "content-length": buf.length, "x-content-type-options": "nosniff", ...secHeaders }); return void res.end(buf);
+        } catch (e: any) { return send(res, 400, { error: String(e?.message ?? e).slice(0, 300) }); }
+      }
       if (route === "/providers" && m === "GET") {
         const mine = pvault.list(ctx.userId);
         return send(res, 200, { added: mine.map((k) => ({ id: k.spec.id, label: k.spec.label, hosts: k.spec.hosts, docsUrl: k.spec.docsUrl ?? null, fingerprint: k.fingerprint, addedAt: k.addedAt })), presets: PRESETS.map((p) => ({ id: p.id, label: p.label, hosts: p.hosts, docsUrl: p.docsUrl, note: p.note })), storage: "memory-only" });
@@ -400,5 +434,5 @@ echo "UCA agent started. Log: $DIR/agent.log"
   }
 
   const server = http.createServer((req, res) => { handle(req, res).catch((e: any) => { if (!res.headersSent) send(res, e?.status ?? 500, { error: redact(String(e?.message ?? "internal_error")) }); else res.end(); }); });
-  return { mirror, store, pvault, broker, server, auth, sessions, approvals, deps, close: () => new Promise<void>((r) => { void mirror?.flush(); const t = setTimeout(r, 3000); t.unref?.(); server.close(() => { clearTimeout(t); r(); }); (server as any).closeIdleConnections?.(); setTimeout(() => (server as any).closeAllConnections?.(), 1000).unref?.(); }) };
+  return { mirror, vm, feed, store, pvault, broker, server, auth, sessions, approvals, deps, close: () => new Promise<void>((r) => { void mirror?.flush(); const t = setTimeout(r, 3000); t.unref?.(); server.close(() => { clearTimeout(t); r(); }); (server as any).closeIdleConnections?.(); setTimeout(() => (server as any).closeAllConnections?.(), 1000).unref?.(); }) };
 }

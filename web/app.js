@@ -21,7 +21,7 @@ async function boot() {
   document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => go(b.dataset.tab)));
   if (!state.me) { try { const st = await (await fetch("/api/setup-status")).json(); if (!st.githubConfigured) { location.replace("/setup"); return; } } catch {} }
   const want = new URLSearchParams(location.search).get("tab");
-  go(["repos", "editor", "tasks", "terminal", "codespaces", "approvals", "settings"].includes(want) ? want : "repos"); pollApprovals(); setInterval(pollApprovals, 8000);
+  go(["repos", "editor", "tasks", "terminal", "workspace", "codespaces", "approvals", "settings"].includes(want) ? want : "repos"); pollApprovals(); setInterval(pollApprovals, 8000);
   document.addEventListener("visibilitychange", () => { if (!document.hidden) pollApprovals(); });
   registerPwa();
 }
@@ -37,7 +37,7 @@ function registerPwa() {
 function go(tab) {
   state.tab = tab;
   document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
-  ({ repos, editor, tasks, terminal, codespaces, approvals, settings }[tab])();
+  ({ repos, editor, tasks, terminal, codespaces, approvals, settings, workspace: () => window.workspaceTab() }[tab])();
 }
 async function needLogin() {
   let st = {}; try { st = await (await fetch("/api/setup-status")).json(); } catch {}

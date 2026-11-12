@@ -13,10 +13,14 @@ import { evaluateCommand } from "../exec/policy.js";
 import { GitHubClient, GitHubError } from "../github/client.js";
 import { CodespacesClient } from "../github/codespaces.js";
 import type { ApprovalService, AuditLog, RateLimiter } from "./services.js";
+import { GATED_TOOLS, VM_HANDLERS, vmPath } from "../instabox/tools.js";
+import { NoVmError } from "../instabox/client.js";
 
 export type ToolScope = "mcp:read" | "mcp:write" | "mcp:exec";
 export interface ToolDeps {
   broker?: import("../codespace/broker.js").CodespaceBroker;
+  vm?: import("../instabox/client.js").InstaBoxManager;
+  feed?: import("../instabox/activity.js").ActivityFeed;
   vault?: import("../providers/vault.js").ProviderVault;
   publicBaseUrl?: string;
   config: Config;
@@ -197,8 +201,12 @@ export const TOOLS: ToolDef[] = [
       const f: any = await gh(c, d).downloadFile(a.owner, a.repo, a.path, a.ref, { maxBytes: a.maxBytes });
       if (a.saveTo) {
         if (f.truncated) throw new Error("File exceeds maxBytes; refusing to save a partial file. Raise maxBytes.");
-        const dest = resolveInside(c.workspaceRoot, a.saveTo); await fsp.mkdir(path.dirname(dest), { recursive: true });
-        await fsp.writeFile(dest, Buffer.from(f.contentBase64 ?? f.content ?? "", "base64")); return { saved: a.saveTo, size: f.size };
+        // never write to the server's disk: save into the user's VM, or refuse if there is none
+        if (!d.vm || !d.feed) throw new NoVmError("VM backend is not configured on this server, so the AI cannot work.");
+        d.vm.require(c.userId); const data = Buffer.from(f.contentBase64 ?? f.content ?? "", "base64");
+        await VM_HANDLERS.write_file({ path: a.saveTo, content: "" }, c, d, { mgr: d.vm, feed: d.feed }); // enforces the 1 GB cap + path rules
+        await d.vm.writeFile(c.userId, vmPath(a.saveTo), data); d.feed.add(c.userId, { tool: "github_download_file", kind: "file", summary: `Downloaded ${a.owner}/${a.repo}:${a.path} to ${a.saveTo}`, ok: true, path: a.saveTo, bytes: data.length });
+        return { saved: a.saveTo, size: f.size, savedIn: "vm" };
       }
       return f;
     } },
@@ -260,12 +268,27 @@ export const TOOLS: ToolDef[] = [
 ];
 
 /** Execute a tool with rate limiting, audit and uniform error mapping. */
+/** Tools that always need a human OK, with the text the human sees. Must stay in step with the originals' needApproval calls (a test enforces it). */
+export const VM_APPROVAL: Record<string, (a: any) => string> = {
+  delete_file: (a) => `Delete ${a.path}${a.recursive ? " (recursive)" : ""}`,
+  install_dependencies: (a) => `Install dependencies in ${a.cwd ?? "."}`,
+  git_push: (a) => `Push ${a.branch ?? "current branch"} to ${a.remote ?? "origin"}`,
+};
+
 export async function runTool(def: ToolDef, args: unknown, ctx: UserContext, deps: ToolDeps): Promise<ToolResult> {
   if (!deps.limiter.allow(ctx.userId)) { deps.audit.write({ userId: ctx.userId, tool: def.name, ok: false, note: "rate_limited" }); return fail("Rate limit exceeded. Wait a moment and retry."); }
   try {
     const parsed = z.object(def.shape).safeParse(args ?? {});
     if (!parsed.success) return fail(`Invalid arguments: ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`);
-    const out = await def.handler(parsed.data, ctx, deps);
+    let out: unknown;
+    if (GATED_TOOLS.has(def.name)) {
+      // Human approval is decided HERE, before any VM handler runs, so a VM handler can never skip it. (run_command/start_job decide for themselves from the command policy.)
+      const rule = VM_APPROVAL[def.name]; if (rule) { if (deps.vm && deps.feed) deps.vm.require(ctx.userId); needApproval(ctx, deps, def.name, rule(parsed.data as any)); }
+      // HARD GATE: tools that would touch the server's disk never run locally. They run in the user's VM, or they refuse.
+      if (!deps.vm || !deps.feed) throw new NoVmError("VM backend is not configured on this server, so the AI cannot work.");
+      deps.vm.require(ctx.userId);
+      out = await VM_HANDLERS[def.name](parsed.data, ctx, deps, { mgr: deps.vm, feed: deps.feed });
+    } else out = await def.handler(parsed.data, ctx, deps);
     deps.audit.write({ userId: ctx.userId, tool: def.name, ok: true });
     return ok(JSON.parse(deps.vault ? deps.vault.scrubAll(ctx.userId, redact(JSON.stringify(out ?? null))) : redact(JSON.stringify(out ?? null))));
   } catch (e: any) {
@@ -274,6 +297,7 @@ export async function runTool(def: ToolDef, args: unknown, ctx: UserContext, dep
       return { content: [{ type: "text", text: JSON.stringify({ status: "approval_required", approvalId: e.approvalId, action: e.action, message: "A human must approve this in the dashboard (Approvals tab). Ask the user to approve, then call this tool again with the same arguments. Do not try to work around it." }) }], isError: true };
     }
     if (e instanceof R.ApprovalRequiredError) return fail(`approval_required: ${e.message}`);
+    if (e instanceof NoVmError) { deps.audit.write({ userId: ctx.userId, tool: def.name, ok: false, note: "no_vm" }); return fail(e.message); }
     deps.audit.write({ userId: ctx.userId, tool: def.name, ok: false, note: deps.vault ? deps.vault.scrubAll(ctx.userId, String(e?.message ?? e)) : String(e?.message ?? e) });
     const msg = e instanceof GitHubError || e instanceof SecurityError || e instanceof Error ? e.message : String(e);
     return fail(deps.vault ? deps.vault.scrubAll(ctx.userId, redact(msg)) : redact(msg));

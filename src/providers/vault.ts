@@ -88,9 +88,10 @@ export class ProviderVault {
    * Perform an HTTPS request to an approved host with the stored key attached. The key never leaves this function
    * except in the Authorization header of the outgoing request, and the response is scrubbed before returning.
    */
-  async request(userId: string, id: string, req: { method?: string; url: string; headers?: Record<string, string>; body?: unknown; timeoutMs?: number }, fetchImpl: typeof fetch = fetch): Promise<{ status: number; headers: Record<string, string>; body: string; truncated: boolean }> {
+  /** Shared by request/requestRaw so the host pinning, header filtering and auth injection can never drift apart. */
+  private prepare(userId: string, id: string, req: { method?: string; url: string; headers?: Record<string, string>; timeoutMs?: number }) {
     const e = this.live(userId, id);
-    if (!e) throw new VaultError(`No key for provider "${id}" in this session. Ask the user to add it in the app (Cloud tab, then Provider keys).`);
+    if (!e) throw new VaultError(`No key for provider "${id}" in this session. Ask the user to add it in the app (Workspace tab, or Cloud then Provider keys).`);
     let u: URL; try { u = new URL(req.url); } catch { throw new VaultError("Invalid URL."); }
     if (u.protocol !== "https:") throw new VaultError("Only https:// URLs are allowed.");
     if (u.username || u.password) throw new VaultError("Credentials in the URL are not allowed.");
@@ -108,16 +109,35 @@ export class ProviderVault {
     if (a.type === "bearer") headers["Authorization"] = `Bearer ${e.secret}`;
     else if (a.type === "header") headers[a.name] = e.secret;
     else headers["Authorization"] = `Basic ${Buffer.from(e.secret.includes(":") ? e.secret : e.secret + ":").toString("base64")}`;
-    let body: string | undefined;
-    if (req.body !== undefined && method !== "GET") { body = typeof req.body === "string" ? req.body : JSON.stringify(req.body); if (body.length > 1_000_000) throw new VaultError("Request body too large."); if (typeof req.body !== "string" && !Object.keys(headers).some((h) => h.toLowerCase() === "content-type")) headers["Content-Type"] = "application/json"; }
-    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), Math.min(req.timeoutMs ?? 30_000, 60_000));
     e.lastUsed = this.now();
+    return { e, u, method, headers };
+  }
+
+  async request(userId: string, id: string, req: { method?: string; url: string; headers?: Record<string, string>; body?: unknown; timeoutMs?: number }, fetchImpl: typeof fetch = fetch): Promise<{ status: number; headers: Record<string, string>; body: string; truncated: boolean }> {
+    const { e, u, method, headers } = this.prepare(userId, id, req);
+    let body: string | undefined;
+    if (req.body !== undefined && method !== "GET") { body = typeof req.body === "string" ? req.body : JSON.stringify(req.body); if (body.length > 1_000_000) throw new VaultError("Request body too large."); if (typeof req.body !== "string" && !Object.keys(headers).some((h) => h.toLowerCase() === "content-type")) headers["content-type"] = "application/json"; }
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), Math.min(req.timeoutMs ?? 30_000, 60_000));
     try {
       // redirect:"manual" so a redirect can never carry the key to a different host
       const r = await fetchImpl(u.toString(), { method, headers, body, redirect: "manual", signal: ctl.signal });
-      const raw = await r.text(); const cap = 200_000; const truncated = raw.length > cap;
+      const raw = await r.text(); const cap = 2_000_000; const truncated = raw.length > cap;
       const outHeaders: Record<string, string> = {}; r.headers.forEach((v, k) => { if (!/^(set-cookie|authorization)$/i.test(k)) outHeaders[k] = this.scrub(e.secret, v); });
       return { status: r.status, headers: outHeaders, body: this.scrub(e.secret, truncated ? raw.slice(0, cap) : raw), truncated };
+    } catch (err: any) {
+      throw new VaultError(this.scrub(e.secret, err?.name === "AbortError" ? "Request timed out." : `Request failed: ${err?.message ?? err}`));
+    } finally { clearTimeout(t); }
+  }
+
+  /** Binary variant for file transfer. Same host pinning, no redirects, key scrubbed from errors. Response bytes are returned untouched (a file is not a place for the key). */
+  async requestRaw(userId: string, id: string, req: { method?: string; url: string; headers?: Record<string, string>; rawBody?: Buffer; timeoutMs?: number; maxBytes?: number }, fetchImpl: typeof fetch = fetch): Promise<{ status: number; body: Buffer; truncated: boolean }> {
+    const { e, u, method, headers } = this.prepare(userId, id, req);
+    if (req.rawBody && req.rawBody.length > 30 * 1024 * 1024) throw new VaultError("Upload too large.");
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), Math.min(req.timeoutMs ?? 30_000, 120_000));
+    try {
+      const r = await fetchImpl(u.toString(), { method, headers, body: method === "GET" ? undefined : (req.rawBody as any), redirect: "manual", signal: ctl.signal });
+      const cap = req.maxBytes ?? 25 * 1024 * 1024; const buf = Buffer.from(await r.arrayBuffer()); const truncated = buf.length > cap;
+      return { status: r.status, body: truncated ? buf.subarray(0, cap) : buf, truncated };
     } catch (err: any) {
       throw new VaultError(this.scrub(e.secret, err?.name === "AbortError" ? "Request timed out." : `Request failed: ${err?.message ?? err}`));
     } finally { clearTimeout(t); }

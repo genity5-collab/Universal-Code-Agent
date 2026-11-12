@@ -9,6 +9,7 @@ import type { AddressInfo } from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "../src/util/config.js";
+import { fakeInstaBox, vmForToken } from "./helpers/fakebox.js";
 import { createApp, type App } from "../src/http/app.js";
 
 // ---- mock GitHub (web + api) on one ephemeral port ----
@@ -59,9 +60,9 @@ async function boot(overrides: Record<string, string> = {}): Promise<Ctx> {
   // choose port first so baseUrl is known
   const probe = http.createServer(); await new Promise<void>((r) => probe.listen(0, "127.0.0.1", () => r())); const port = (probe.address() as AddressInfo).port; await new Promise((r) => probe.close(r));
   const config = loadConfig({ PORT: String(port), UCA_BASE_URL: `http://127.0.0.1:${port}`, UCA_DATA_DIR: tmp, GITHUB_CLIENT_ID: "cid", GITHUB_CLIENT_SECRET: "csecret", UCA_REQUIRE_APPROVAL: "true", ...overrides } as any);
-  const app = createApp(config, { githubApiBase: gh.url, githubWebBase: gh.url });
+  const box = fakeInstaBox(); const app = createApp(config, { githubApiBase: gh.url, githubWebBase: gh.url, fetchImpl: box.fetchImpl, instaboxPollMs: 5 } as any);
   await new Promise<void>((r) => app.server.listen(port, "127.0.0.1", () => r()));
-  return { app, base: config.baseUrl, gh, tmp, async stop() { await app.close(); gh.server.close(); fs.rmSync(tmp, { recursive: true, force: true }); } };
+  return { app, base: config.baseUrl, gh, tmp, async stop() { await app.close(); gh.server.close(); box.stop(); fs.rmSync(tmp, { recursive: true, force: true }); } };
 }
 
 /** Run the entire browser-like flow: dynamic registration -> authorize -> GitHub login -> consent -> code -> token. */
@@ -114,7 +115,7 @@ test("discovery metadata and unauthenticated /mcp challenge", async () => {
 test("full OAuth 2.1 + PKCE flow, then a real MCP client lists and calls tools", async () => {
   const c = await boot();
   try {
-    const f = await oauthFlow(c); const tok = await getToken(c, f);
+    const f = await oauthFlow(c); const tok = await getToken(c, f); await vmForToken(c.app, tok.access_token);
     assert.match(tok.scope, /mcp:read/);
     const client = await mcpClient(c, tok.access_token);
     const tools = await client.listTools(); const names = tools.tools.map((t) => t.name);
@@ -140,23 +141,24 @@ test("full OAuth 2.1 + PKCE flow, then a real MCP client lists and calls tools",
 test("sensitive actions require human approval, and approval is single use", async () => {
   const c = await boot();
   try {
-    const f = await oauthFlow(c); const tok = await getToken(c, f); const client = await mcpClient(c, tok.access_token);
+    const f = await oauthFlow(c); const tok = await getToken(c, f); await vmForToken(c.app, tok.access_token); const client = await mcpClient(c, tok.access_token);
     await client.callTool({ name: "create_file", arguments: { path: "victim.txt", content: "x" } });
     const r1 = await client.callTool({ name: "delete_file", arguments: { path: "victim.txt" } }) as any;
     assert.equal(r1.isError, true); const j = JSON.parse(text(r1)); assert.equal(j.status, "approval_required");
-    assert.ok(fs.readdirSync(path.join(c.tmp, "workspaces")).length === 1);
-    const ws = path.join(c.tmp, "workspaces", fs.readdirSync(path.join(c.tmp, "workspaces"))[0]); assert.ok(fs.existsSync(path.join(ws, "victim.txt")), "must not delete before approval");
+    // The file lives in the user's VM, not on this server: check it through the AI's own read tool.
+    const exists = async () => !((await client.callTool({ name: "read_file", arguments: { path: "victim.txt" } }) as any).isError);
+    assert.ok(await exists(), "must not delete before approval");
     // approve through the dashboard API with session + CSRF
     const me = await (await fetch(`${c.base}/api/me`, { headers: { cookie: f.jar.header() } })).json() as any;
     const ap = await fetch(`${c.base}/api/approvals/${j.approvalId}/approve`, { method: "POST", headers: { cookie: f.jar.header(), "x-csrf-token": me.csrf, "content-type": "application/json" }, body: "{}" }); assert.equal(ap.status, 200);
-    const r2 = await client.callTool({ name: "delete_file", arguments: { path: "victim.txt" } }) as any; assert.ok(!r2.isError, text(r2)); assert.ok(!fs.existsSync(path.join(ws, "victim.txt")));
+    const r2 = await client.callTool({ name: "delete_file", arguments: { path: "victim.txt" } }) as any; assert.ok(!r2.isError, text(r2)); assert.ok(!(await exists()), "file is gone from the VM after approval");
     // single use: asking again needs a new approval
     await client.callTool({ name: "create_file", arguments: { path: "victim.txt", content: "x" } });
     const r3 = await client.callTool({ name: "delete_file", arguments: { path: "victim.txt" } }) as any; assert.equal(JSON.parse(text(r3)).status, "approval_required");
     // CSRF enforced on state-changing dashboard calls
     const noCsrf = await fetch(`${c.base}/api/approvals/${j.approvalId}/deny`, { method: "POST", headers: { cookie: f.jar.header(), "content-type": "application/json" }, body: "{}" }); assert.equal(noCsrf.status, 403);
     // denied commands never run even with approval flow
-    const den = await client.callTool({ name: "run_command", arguments: { command: "sudo ls" } }) as any; assert.equal(den.isError, true); assert.match(text(den), /denied/i);
+    const den = await client.callTool({ name: "run_command", arguments: { command: "sudo ls" } }) as any; assert.equal(den.isError, true); assert.match(text(den), /denied|blocked/i);
     await client.close();
   } finally { await c.stop(); }
 });

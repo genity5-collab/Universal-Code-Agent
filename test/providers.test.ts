@@ -9,6 +9,7 @@ import type { AddressInfo } from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "../src/util/config.js";
+import { fakeInstaBox, vmForToken } from "./helpers/fakebox.js";
 import { createApp, type App } from "../src/http/app.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -65,9 +66,9 @@ async function boot(overrides: Record<string, string> = {}): Promise<Ctx> {
   // choose port first so baseUrl is known
   const probe = http.createServer(); await new Promise<void>((r) => probe.listen(0, "127.0.0.1", () => r())); const port = (probe.address() as AddressInfo).port; await new Promise((r) => probe.close(r));
   const config = loadConfig({ PORT: String(port), UCA_BASE_URL: `http://127.0.0.1:${port}`, UCA_DATA_DIR: tmp, GITHUB_CLIENT_ID: "cid", GITHUB_CLIENT_SECRET: "csecret", UCA_REQUIRE_APPROVAL: "true", ...overrides } as any);
-  const app = createApp(config, { githubApiBase: gh.url, githubWebBase: gh.url });
+  const box = fakeInstaBox(); const app = createApp(config, { githubApiBase: gh.url, githubWebBase: gh.url, fetchImpl: box.fetchImpl, instaboxPollMs: 5 } as any);
   await new Promise<void>((r) => app.server.listen(port, "127.0.0.1", () => r()));
-  return { app, base: config.baseUrl, gh, tmp, async stop() { await app.close(); gh.server.close(); fs.rmSync(tmp, { recursive: true, force: true }); } };
+  return { app, base: config.baseUrl, gh, tmp, async stop() { await app.close(); gh.server.close(); box.stop(); fs.rmSync(tmp, { recursive: true, force: true }); } };
 }
 
 /** Run the entire browser-like flow: dynamic registration -> authorize -> GitHub login -> consent -> code -> token. */
@@ -350,8 +351,8 @@ async function bootGuest(env: Record<string, string> = {}) {
   const gh = await mockGithub(); const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "uca-guest-"));
   const probe = http.createServer(); await new Promise<void>((r) => probe.listen(0, "127.0.0.1", () => r())); const port = (probe.address() as AddressInfo).port; await new Promise((r) => probe.close(r));
   const config = loadConfig({ PORT: String(port), UCA_BASE_URL: `http://127.0.0.1:${port}`, UCA_DATA_DIR: tmp, ...env } as any); // NOTE: no GitHub client id or secret
-  const app = createApp(config, { githubApiBase: gh.url, githubWebBase: gh.url }); await new Promise<void>((r) => app.server.listen(port, "127.0.0.1", () => r()));
-  return { app, config, base: config.baseUrl, gh, tmp, async stop() { await app.close(); gh.server.close(); fs.rmSync(tmp, { recursive: true, force: true }); } };
+  const box = fakeInstaBox(); const app = createApp(config, { githubApiBase: gh.url, githubWebBase: gh.url, fetchImpl: box.fetchImpl, instaboxPollMs: 5 } as any); await new Promise<void>((r) => app.server.listen(port, "127.0.0.1", () => r()));
+  return { app, config, base: config.baseUrl, gh, tmp, async stop() { await app.close(); gh.server.close(); box.stop(); fs.rmSync(tmp, { recursive: true, force: true }); } };
 }
 function pkce() { const verifier = crypto.randomBytes(32).toString("base64url"); return { verifier, challenge: crypto.createHash("sha256").update(verifier).digest("base64url") }; }
 
@@ -380,7 +381,7 @@ test("guest E2E: with NO GitHub app and NO keys, a real MCP client connects via 
     const code = new URL(dec.headers.get("location")!).searchParams.get("code"); assert.ok(code, "got an authorization code");
     const tok = await (await fetch(`${c.base}/token`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "authorization_code", code: code!, redirect_uri: redirectUri, client_id: reg.client_id, code_verifier: verifier, resource: `${c.base}/mcp` }) })).json() as any;
     assert.ok(tok.access_token, JSON.stringify(tok));
-    const client = await mcpClient({ base: c.base } as any, tok.access_token);
+    await vmForToken(c.app, tok.access_token); const client = await mcpClient({ base: c.base } as any, tok.access_token);
     const w = await client.callTool({ name: "write_file", arguments: { path: "hello.txt", content: "hi guest" } }) as any; assert.ok(!w.isError, text(w));
     const r = await client.callTool({ name: "read_file", arguments: { path: "hello.txt" } }) as any; assert.match(text(r), /hi guest/);
     // GitHub tools explain themselves instead of failing mysteriously
@@ -406,23 +407,23 @@ async function guestToken(c: { base: string }) {
   return { token: tok.access_token as string, cookie, me };
 }
 
-test("guest isolation: two guests cannot see, read or traverse into each other's files", async () => {
+test("guest isolation: two guests get separate VMs and cannot see, read or traverse into each other's files", async () => {
   const c = await bootGuest();
   try {
     const A = await guestToken(c); const B = await guestToken(c); assert.notEqual(A.me.user.userId, B.me.user.userId);
+    const ma = (await vmForToken(c.app, A.token), c.app.vm.status(A.me.user.userId).machineId); const mb = (await vmForToken(c.app, B.token), c.app.vm.status(B.me.user.userId).machineId);
+    assert.ok(ma && mb && ma !== mb, "two separate machines");
     const ca = await mcpClient({ base: c.base } as any, A.token); const cb = await mcpClient({ base: c.base } as any, B.token);
     assert.ok(!((await ca.callTool({ name: "write_file", arguments: { path: "secret.txt", content: "A-ONLY-SECRET" } })) as any).isError);
-    const bDirName = fs.readdirSync(path.join(c.tmp, "workspaces")).find((d) => !fs.existsSync(path.join(c.tmp, "workspaces", d, "secret.txt")))!; const aDirName = fs.readdirSync(path.join(c.tmp, "workspaces")).find((d) => fs.existsSync(path.join(c.tmp, "workspaces", d, "secret.txt")))!;
-    assert.ok(aDirName && bDirName && aDirName !== bDirName, "two separate folders");
     const lsB = text(await cb.callTool({ name: "list_directory", arguments: { path: "." } })); assert.ok(!lsB.includes("secret.txt"), "B can see A's file: " + lsB);
     const rdB = await cb.callTool({ name: "read_file", arguments: { path: "secret.txt" } }) as any; assert.equal(rdB.isError, true); assert.ok(!text(rdB).includes("A-ONLY-SECRET"));
-    for (const evil of [`../${aDirName}/secret.txt`, `../../workspaces/${aDirName}/secret.txt`, `/${path.join(c.tmp, "workspaces", aDirName, "secret.txt")}`, `..%2f${aDirName}%2fsecret.txt`]) {
+    for (const evil of [`../secret.txt`, `../../${ma}/home/workspace/secret.txt`, `/data/home/workspace/../${ma}/secret.txt`, `..%2fsecret.txt`, `/etc/passwd`]) {
       const r = await cb.callTool({ name: "read_file", arguments: { path: evil } }) as any; assert.equal(r.isError, true, "traversal allowed: " + evil); assert.ok(!text(r).includes("A-ONLY-SECRET"), evil);
     }
-    // a guest cannot reach another guest's workspace through a command either
-    const cmd = await cb.callTool({ name: "run_command", arguments: { command: `cat ../${aDirName}/secret.txt` } }) as any; assert.ok(!text(cmd).includes("A-ONLY-SECRET"), "command escaped the workspace: " + text(cmd));
-    // and B's token cannot be used to act as A
-    assert.equal((await fetch(`${c.base}/api/me`, { headers: { authorization: `Bearer ${B.token}` } })).status === 200 ? "ok" : "ok", "ok");
+    // and A really has it, so the checks above prove something
+    assert.match(text(await ca.callTool({ name: "read_file", arguments: { path: "secret.txt" } })), /A-ONLY-SECRET/);
+    // B's own machine on the same fake host cannot be used to reach A's: a command in B only ever runs in B's machine
+    const cmd = await cb.callTool({ name: "run_command", arguments: { command: "cat secret.txt" } }) as any; assert.ok(!text(cmd).includes("A-ONLY-SECRET"), "command saw A's file: " + text(cmd));
     // anonymous gets nothing
     assert.equal((await fetch(`${c.base}/mcp`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) })).status, 401);
     await ca.close(); await cb.close();
@@ -446,7 +447,7 @@ test("guest safety: cap on guest accounts, rate limit, POST-only creation, off w
 test("guest safety: dangerous commands are blocked or need approval for guests too, and keys stay per-guest", async () => {
   const c = await bootGuest();
   try {
-    const A = await guestToken(c); const B = await guestToken(c); const client = await mcpClient({ base: c.base } as any, A.token);
+    const A = await guestToken(c); const B = await guestToken(c); await vmForToken(c.app, A.token); const client = await mcpClient({ base: c.base } as any, A.token);
     const bad = ["rm", "-rf", " /"].join(""); const r1 = await client.callTool({ name: "run_command", arguments: { command: bad } }) as any; assert.equal(r1.isError, true, "destructive command must not run: " + text(r1));
     const inst = await client.callTool({ name: "run_command", arguments: { command: "npm install left-pad" } }) as any; assert.ok(/approval/i.test(text(inst)), "installs must wait for approval: " + text(inst));
     const H = { cookie: A.cookie, "x-csrf-token": A.me.csrf, "content-type": "application/json" };

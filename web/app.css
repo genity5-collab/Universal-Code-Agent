@@ -37,3 +37,12 @@ nav button{min-width:0}nav button span{max-width:100%;overflow:hidden;text-overf
 .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:99px;animation:sp .8s linear infinite;vertical-align:-2px}@keyframes sp{to{transform:rotate(360deg)}}
 @media(prefers-reduced-motion:reduce){.spin{animation:none}}
 @media(display-mode:standalone){header{padding-top:max(14px,env(safe-area-inset-top))}}
+
+.live{max-height:46vh;overflow:auto;background:#070a10;border:1px solid #1d2636;border-radius:10px;padding:8px}
+.act{display:flex;gap:8px;padding:6px 4px;border-bottom:1px solid #141b28;min-width:0}.act:last-child{border-bottom:0}
+.act .ai{width:20px;text-align:center;flex:none}.act>div{min-width:0;flex:1}.act.bad b{color:#ff8a8a}
+.out{margin:4px 0 0;padding:6px 8px;background:#0b0f17;border-radius:6px;max-height:160px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-size:12px}
+.bar{height:8px;background:#1d2636;border-radius:6px;overflow:hidden}.fill{height:100%;background:#3b82f6}.fill.hot{background:#ef4444}
+.row{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #141b28}.row span:first-child{min-width:0;overflow:hidden;text-overflow:ellipsis;flex:1}
+.dl{padding:4px 10px;border:1px solid #2a3750;border-radius:8px;text-decoration:none;font-size:13px;white-space:nowrap}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#888}.dot.on{background:#22c55e}
