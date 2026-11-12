@@ -456,3 +456,44 @@ test("FAST FRAMES: the background capture loop stops by itself when nobody is wa
     fs.utimesSync(beat, old, old);
   } finally { await b.stop(); }
 });
+
+// ---------------- attach an existing workspace + newest-window-wins + cross-site ----------------
+const PUT = (u: any) => u.deps.vault.put("guest:tester", { id: "instabox", label: "I", hosts: ["api.instabox.sh"], auth: { type: "header", name: "X-API-Key" } }, KEY);
+test("attach: use a machine that already exists; foreign ids refused; Stop only disconnects", async () => {
+  const b = await boot(); try {
+    const u = await asUser(b); PUT(u);
+    const dir = fs.mkdtempSync(path.join(b.vmf.root, "pre-")); fs.mkdirSync(path.join(dir, "home/workspace"), { recursive: true }); b.vmf.sessions.set("mach_pre1", dir);
+    const list = await u.deps.vm.listMachines("guest:tester"); assert.ok(list.some((m: any) => m.id === "mach_pre1"));
+    await assert.rejects(() => u.deps.vm.attach("guest:tester", "mach_not_mine"), /not in your InstaBox account/);
+    await assert.rejects(() => u.deps.vm.attach("guest:tester", "../x; echo hi"), /Invalid machine id/);
+    assert.equal(u.deps.vm.status("guest:tester").running, false, "a refused attach connects nothing");
+    await u.deps.vm.attach("guest:tester", "mach_pre1");
+    const st = u.deps.vm.status("guest:tester"); assert.equal(st.running, true); assert.equal(st.attached, true);
+    const w = await u.call("create_file", { path: "a.txt", content: "hi" }); assert.ok(!w.isError, text(w));
+    assert.equal(fs.readFileSync(path.join(dir, "home/workspace/a.txt"), "utf8"), "hi", "the AI works inside the existing machine");
+    await u.deps.vm.stop("guest:tester");
+    assert.ok(b.vmf.sessions.has("mach_pre1"), "Stop on an attached machine never deletes it");
+    assert.equal(u.deps.vm.status("guest:tester").running, false);
+  } finally { await b.stop(); }
+});
+test("cross-site writes are refused even with a valid token; same-site and no-Origin pass", async () => {
+  const b = await boot(); try {
+    const sm = (b.app as any).sessions; const { cookie, csrfToken } = sm.createSession("guest:x", {}); const ck = cookie.split(";")[0];
+    const hdr = (o: any) => ({ "x-csrf-token": csrfToken, host: "app.example.com", ...o });
+    const r = (headers: any, method = "POST") => sm.requireSession(method, ck, headers);
+    assert.equal(r(hdr({})).ok, true, "no Origin (non-browser client) passes");
+    assert.equal(r(hdr({ origin: "https://app.example.com" })).ok, true, "same site passes");
+    for (const bad of ["https://evil.example", "https://app.example.com.evil.example", "null", "not a url"]) { const x: any = r(hdr({ origin: bad })); assert.equal(x.ok, false, bad); assert.equal(x.status, 409, bad); }
+    assert.equal(r({ host: "app.example.com", origin: "https://evil.example" }, "GET").ok, true, "reads are not affected");
+  } finally { await b.stop(); }
+});
+test("live window: the newest window wins and older ones are told they are stale", async () => {
+  const b = await boot(); try {
+    const u = await asUser(b); PUT(u); await u.call("vm_start", {});
+    const a = await u.call("vm_live", {}); const a2 = await u.call("vm_live", {});
+    assert.ok(a2.structuredContent.epoch > a.structuredContent.epoch, "each vm_live takes a newer number");
+    const p = await u.call("vm_screen_poll", {}); assert.equal(p.structuredContent.currentEpoch, a2.structuredContent.epoch);
+    assert.ok(p.structuredContent.currentEpoch > a.structuredContent.epoch, "the first window can see it is stale");
+    const other = await asUser(b, "guest:fresh-" + Date.now()); const o = await other.call("vm_screen_poll", {}); assert.equal(o.structuredContent?.currentEpoch ?? 0, 0, "epochs are per user");
+  } finally { await b.stop(); }
+});

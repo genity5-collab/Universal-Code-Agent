@@ -20,7 +20,7 @@ export class NoVmError extends Error {
   constructor(msg = "No VM is attached. The AI cannot work without one. Ask the user to open the app, go to Workspace, add their InstaBox key and press Start VM, then retry.") { super(msg); }
 }
 export interface ExecResult { stdout: string; stderr: string; exitCode: number | null; timedOut?: boolean; truncated?: boolean }
-interface Session { machineId: string; startedAt: number }
+interface Session { machineId: string; startedAt: number; attached?: boolean }
 
 export class InstaBoxManager {
   private sessions = new Map<string, Session>();
@@ -28,10 +28,10 @@ export class InstaBoxManager {
   constructor(private vault: ProviderVault, private fetchImpl: typeof fetch = fetch, private baseUrl = `https://${INSTABOX_HOST}`, private opts: { pollMs?: number; startTimeoutMs?: number } = {}) {}
 
   hasKey(userId: string): boolean { return this.vault.has(userId, INSTABOX_ID); }
-  status(userId: string): { hasKey: boolean; running: boolean; starting: boolean; machineId?: string } {
+  status(userId: string): { hasKey: boolean; running: boolean; starting: boolean; machineId?: string; attached?: boolean } {
     const hasKey = this.hasKey(userId); const s = this.sessions.get(userId);
     if (s && !hasKey) { this.sessions.delete(userId); return { hasKey, running: false, starting: false }; }
-    return { hasKey, running: !!s, starting: this.starting.has(userId), machineId: s?.machineId };
+    return { hasKey, running: !!s, starting: this.starting.has(userId), machineId: s?.machineId, attached: s?.attached };
   }
   /** The single gate every local-disk tool passes through. Throws NoVmError unless this user has a live machine. */
   require(userId: string): string {
@@ -80,8 +80,25 @@ export class InstaBoxManager {
       return { machineId: op.machineId };
     } finally { this.starting.delete(userId); }
   }
+  /** List the machines this key can see (read-only). */
+  async listMachines(userId: string): Promise<{ id: string; name: string; state: string }[]> {
+    if (!this.hasKey(userId)) throw new NoVmError("Add your InstaBox key first.");
+    const r = await this.call(userId, "GET", "/v1/machines?limit=100"); if (r.status !== 200) this.fail(r, "list your machines");
+    let j: any; try { j = JSON.parse(r.body); } catch { throw new Error("InstaBox returned an unreadable response."); }
+    const arr: any[] = Array.isArray(j) ? j : Array.isArray(j?.machines) ? j.machines : Array.isArray(j?.items) ? j.items : Array.isArray(j?.data) ? j.data : [];
+    return arr.filter((m) => m && typeof m.id === "string").map((m) => ({ id: String(m.id).slice(0, 80), name: String(m.name ?? m.id).slice(0, 80), state: String(m.state ?? m.status ?? "unknown").slice(0, 30) }));
+  }
+  /** Use a machine that already exists. Ownership is proven by the key itself: the id must be in the key's own list. Stop only disconnects it. */
+  async attach(userId: string, machineId: string): Promise<{ machineId: string }> {
+    const id = String(machineId ?? ""); if (!/^[A-Za-z0-9._-]{1,80}$/.test(id)) throw new Error("Invalid machine id.");
+    const list = await this.listMachines(userId);
+    if (!list.some((m) => m.id === id)) throw new Error("That machine is not in your InstaBox account.");
+    this.sessions.set(userId, { machineId: id, startedAt: Date.now(), attached: true });
+    return { machineId: id };
+  }
   async stop(userId: string): Promise<boolean> {
     const s = this.sessions.get(userId); this.sessions.delete(userId); if (!s) return false;
+    if (s.attached) return true; // a machine you brought is only disconnected, never deleted
     try { await this.call(userId, "DELETE", `/v1/machines/${encodeURIComponent(s.machineId)}`, { headers: { "Idempotency-Key": crypto.randomUUID(), "X-Confirm-Delete": s.machineId } }); } catch { /* it also auto-pauses/expires on InstaBox's side */ }
     return true;
   }

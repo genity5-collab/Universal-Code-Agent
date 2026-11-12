@@ -24,6 +24,7 @@ export function fakeInstaBox() {
     const err = (status: number, code: string, message = code) => reply({ error: { code, message, retryable: false } }, status);
     if (u.hostname !== "api.instabox.sh") return realFetch(url, init); // other traffic (e.g. the local GitHub mock) is not ours to fake
     if (init.headers?.["X-API-Key"] !== KEY) return err(401, "invalid_key");
+    if (u.pathname === "/v1/machines" && method === "GET") return reply({ machines: [...machines.keys()].map((id) => ({ id, name: "n-" + id, state: "running" })) });
     if (u.pathname === "/v1/machines" && method === "POST") {
       const ik = init.headers?.["Idempotency-Key"]; if (!ik) return err(400, "bad_request", "Idempotency-Key required"); if (idem.has(ik)) return reply(JSON.parse(idem.get(ik)!), 202);
       const body = JSON.parse(init.body || "{}"); const id = "m_" + String(++n).padStart(26, "a"); const dir = path.join(root, id); fs.mkdirSync(path.join(dir, "home", "workspace"), { recursive: true }); fs.mkdirSync(path.join(dir, "tmp"), { recursive: true });

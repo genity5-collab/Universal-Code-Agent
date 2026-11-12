@@ -15,8 +15,13 @@ import { WORKSPACE_DIR } from "./tools.js";
 import { shq } from "./client.js";
 import type { Desktop } from "./desktop.js";
 
-export const LIVE_URI = "ui://widget/vm-live-v3.html";
+export const LIVE_URI = "ui://widget/vm-live-v4.html";
 export const LIVE_MIME = "text/html;profile=mcp-app";
+
+/** Newest live window wins: each vm_live call takes the next number for that user; older windows see they are stale and stop. Bounded. */
+const epochs = new Map<string, number>();
+function claimEpoch(userId: string): number { const n = (epochs.get(userId) ?? 0) + 1; epochs.delete(userId); epochs.set(userId, n); if (epochs.size > 500) epochs.delete(epochs.keys().next().value as string); return n; }
+function currentEpoch(userId: string): number { return epochs.get(userId) ?? 0; }
 
 type Snap = { running: boolean; machineId?: string; items: unknown[]; lastId: number; files: { name: string; type: string; size: number }[]; usedBytes: number };
 
@@ -50,7 +55,7 @@ export const LIVE_TOOLS: (ToolDef & { meta?: Record<string, unknown> })[] = [
     scope: "mcp:read", readOnly: true, shape: {},
     meta: { ui: { resourceUri: LIVE_URI }, "openai/outputTemplate": LIVE_URI, "openai/toolInvocation/invoking": "Opening the live VM window...", "openai/toolInvocation/invoked": "Live VM window open." },
     handler: async (_a, c, d) => {
-      const s: any = await snapshot(c, d, 0, true); s.screen = await screen(c, d);
+      const s: any = await snapshot(c, d, 0, true); s.screen = await screen(c, d); s.epoch = claimEpoch(c.userId);
       return { __structured: s, text: s.running ? `Live VM window opened. ${s.items.length} recent action(s); ${s.files.length} file(s) shown.` : "The VM is not running, so there is nothing to show yet. Call vm_start first (the user must have added their InstaBox key)." };
     },
   },
@@ -59,14 +64,14 @@ export const LIVE_TOOLS: (ToolDef & { meta?: Record<string, unknown> })[] = [
     description: "Internal: returns the activity since a given id and the current file list. Called by the live window, not by the model.",
     scope: "mcp:read", readOnly: true, shape: { sinceId: z.number().int().min(0).max(1e9).optional(), files: z.boolean().optional() },
     meta: { ui: { visibility: ["app"] }, "openai/widgetAccessible": true },
-    handler: async (a, c, d) => ({ __structured: await snapshot(c, d, Number(a.sinceId ?? 0), a.files !== false), text: "ok" }),
+    handler: async (a, c, d) => ({ __structured: { ...(await snapshot(c, d, Number(a.sinceId ?? 0), a.files !== false)), currentEpoch: currentEpoch(c.userId) }, text: "ok" }),
   },
   {
     name: "vm_screen_poll", title: "Live VM screen refresh (used by the window itself)",
     description: "Internal: returns the current picture of the VM desktop for the live window. Called by the window, not by the model.",
     scope: "mcp:read", readOnly: true, shape: {},
     meta: { ui: { visibility: ["app"] }, "openai/widgetAccessible": true },
-    handler: async (_a, c, d) => ({ __structured: { screen: await screen(c, d) }, text: "ok" }),
+    handler: async (_a, c, d) => ({ __structured: { screen: await screen(c, d), currentEpoch: currentEpoch(c.userId) }, text: "ok" }),
   },
 ];
 
@@ -117,8 +122,13 @@ details{border-top:1px solid var(--line)}summary{cursor:pointer;padding:6px 10px
     if(sc.image&&typeof sc.image==="string"&&(sc.image.indexOf("data:image/png;base64,")===0||sc.image.indexOf("data:image/jpeg;base64,")===0)&&!/[^A-Za-z0-9+=]/.test(sc.image.slice(sc.image.indexOf(",")+1).split("/").join(""))){img.src=sc.image;img.hidden=false;msg.hidden=true}
     else if(sc.note){if(img.hidden){msg.textContent=sc.note;msg.hidden=false}}
   }
+  var myEpoch=0,stale=false;
+  function goStale(){stale=true;paused=true;pauseBtn.hidden=true;dot.className="dot";title.textContent="Live VM - a newer window is open";foot.textContent="This window stopped because a newer one was opened below."}
   function render(s){
     if(!s||typeof s!=="object")return;
+    if(stale)return;
+    if(typeof s.epoch==="number"&&!myEpoch)myEpoch=s.epoch;
+    if(typeof s.currentEpoch==="number"&&myEpoch&&s.currentEpoch>myEpoch){goStale();return}
     if(typeof s.running==="boolean"){dot.className="dot"+(s.running?" on":"");title.textContent=s.running?"Live VM - running":"Live VM - not running"}
     if(s.screen)showScreen(s.screen);
     (s.items||[]).forEach(function(a){if(a.id>last){addItem(a);last=a.id}});
@@ -142,6 +152,8 @@ details{border-top:1px solid var(--line)}summary{cursor:pointer;padding:6px 10px
     if(m.method==="ui/notifications/tool-result"){render(fromResult(m.params))}
     if(m.method==="ui/resource-teardown"&&m.id!=null){send({jsonrpc:"2.0",id:m.id,result:{}})}
   });
+  var fs=el("button",null,"Fullscreen");fs.type="button";fs.style.cssText="margin:6px 0";img.parentNode.insertBefore(fs,img.nextSibling);
+  fs.onclick=function(){var t=img;if(document.fullscreenElement){document.exitFullscreen()}else if(t.requestFullscreen){t.requestFullscreen().catch(function(){notify("ui/notifications/request-display-mode",{mode:"fullscreen"});request("ui/request-display-mode",{mode:"fullscreen"}).catch(function(){})})}else{request("ui/request-display-mode",{mode:"fullscreen"}).catch(function(){})}};
   pauseBtn.onclick=function(){paused=!paused;pauseBtn.textContent=paused?"Resume":"Pause";if(!paused)loop()};
   function size(){notify("ui/notifications/size-changed",{width:document.documentElement.scrollWidth,height:document.documentElement.scrollHeight})}
   if(window.ResizeObserver)new ResizeObserver(size).observe(document.body);

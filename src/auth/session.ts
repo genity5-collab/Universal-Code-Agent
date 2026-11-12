@@ -281,6 +281,13 @@ export class SessionManager {
     const m = method.toUpperCase();
     const safe = m === "GET" || m === "HEAD" || m === "OPTIONS";
     if (!safe) {
+      // Cross-site writes are refused even if a token leaks: a browser always sends Origin on cross-site POST/DELETE.
+      const og = headers["origin"]; const origin = Array.isArray(og) ? og[0] : og;
+      if (origin) {
+        const hostH = headers["host"]; const host = Array.isArray(hostH) ? hostH[0] : hostH;
+        let ok = false; try { ok = !!host && new URL(origin).host === host; } catch { ok = false; }
+        if (!ok) return { ok: false, status: 409, error: "cross_site_blocked" };
+      }
       const raw = headers[CSRF_HEADER] ?? headers[CSRF_HEADER.toUpperCase()];
       const token = Array.isArray(raw) ? raw[0] : raw;
       if (!this.verifyCsrf(principal, token ?? undefined)) return { ok: false, status: 403, error: "invalid_csrf" };

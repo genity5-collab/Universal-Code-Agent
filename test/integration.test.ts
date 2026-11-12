@@ -262,12 +262,12 @@ test("LIVE VM WINDOW in ChatGPT: vm_live opens an inline widget, the window can 
     const tools = (await client.listTools()).tools as any[];
     // the model-facing tool links to the widget with both the standard and the ChatGPT alias
     const live = tools.find((t) => t.name === "vm_live"); assert.ok(live, "vm_live is offered");
-    assert.equal(live._meta?.ui?.resourceUri, "ui://widget/vm-live-v3.html"); assert.equal(live._meta?.["openai/outputTemplate"], "ui://widget/vm-live-v3.html");
+    assert.equal(live._meta?.ui?.resourceUri, "ui://widget/vm-live-v4.html"); assert.equal(live._meta?.["openai/outputTemplate"], "ui://widget/vm-live-v4.html");
     // the poll tool is for the window only: it must be flagged app-only so hosts hide it from the model
     const poll = tools.find((t) => t.name === "vm_live_poll"); assert.ok(poll, "the host needs to see it to forward the window's calls");
     assert.deepEqual(poll._meta?.ui?.visibility, ["app"]);
     // the widget resource is served as an MCP App, is self-contained and declares no network access
-    const res = await client.readResource({ uri: "ui://widget/vm-live-v3.html" }) as any; const item = res.contents[0];
+    const res = await client.readResource({ uri: "ui://widget/vm-live-v4.html" }) as any; const item = res.contents[0];
     assert.equal(item.mimeType, "text/html;profile=mcp-app"); assert.match(item.text, /ui\/initialize/); assert.match(item.text, /vm_live_poll/);
     assert.deepEqual(item._meta?.ui?.csp?.connectDomains, [], "no network access"); assert.deepEqual(item._meta?.ui?.csp?.resourceDomains, []);
     assert.ok(!/https?:\/\//.test(item.text.replace(/https?:\/\/(www\.)?w3\.org[^"' ]*/g, "")), "the window makes no external requests");
@@ -312,7 +312,7 @@ test("LIVE SCREEN in ChatGPT: the window shows the VM's real desktop picture, th
     const sp = tools.find((t) => t.name === "vm_screen_poll"); assert.ok(sp); assert.deepEqual(sp._meta?.ui?.visibility, ["app"], "the model never sees the screen refresh tool");
     for (const n of ["desktop_start", "desktop_screenshot", "desktop_click", "desktop_type", "desktop_press", "desktop_scroll", "desktop_open", "desktop_drag", "desktop_move"]) assert.ok(tools.find((t) => t.name === n), n + " is offered to the AI");
     assert.equal(tools.find((t) => t.name === "desktop_screenshot").annotations?.readOnlyHint, true);
-    const res = await client.readResource({ uri: "ui://widget/vm-live-v3.html" }) as any; const html = res.contents[0].text;
+    const res = await client.readResource({ uri: "ui://widget/vm-live-v4.html" }) as any; const html = res.contents[0].text;
     assert.match(html, /vm_screen_poll/); assert.match(html, /id="screen"/); assert.deepEqual(res.contents[0]._meta.ui.csp.connectDomains, []);
     assert.ok(html.includes('indexOf("data:image/png;base64,")===0') && html.includes('indexOf("data:image/jpeg;base64,")===0'), "the widget accepts only PNG data URLs for the picture"); assert.ok(!/<img[^>]+src="http/i.test(html), "no remote pictures");
     const script = /<script>([\s\S]*)<\/script>/.exec(html)![1]; assert.doesNotThrow(() => new Function(script), "the widget script, exactly as served, is valid JavaScript");

@@ -77,3 +77,9 @@ Some VMs have a graphical Linux desktop (InstaBox `agent-browser` does). Use it 
 - `Workspace limit reached` -> delete files, or ask the user to download and clear space.
 - `InstaBox limit reached` / `no capacity` -> a plan limit or a busy region; wait a minute or ask the user to check their InstaBox plan.
 - `Blocked: ...` -> the command was refused by the safety policy; use a safer approach.
+
+## Live preview and existing workspaces
+
+- Call `vm_live` at the start of your work and again whenever you send a new reply that acts in the VM, so the user sees the screen with every message. Only the **newest** window stays live: when you open a new one, the earlier one stops by itself and says so. Do not open more than one per reply.
+- Every live window has a **Fullscreen** button. The user can also expand it from the app's Workspace tab.
+- The user can attach a workspace (machine) they already have: Workspace tab, "Use a workspace you already have". It is only connected, never created or deleted by us. `vm_stop` on an attached workspace just disconnects it. Do not claim files will be lost when the status shows `attached: true`.
