@@ -46,3 +46,10 @@ nav button{min-width:0}nav button span{max-width:100%;overflow:hidden;text-overf
 .row{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #141b28}.row span:first-child{min-width:0;overflow:hidden;text-overflow:ellipsis;flex:1}
 .dl{padding:4px 10px;border:1px solid #2a3750;border-radius:8px;text-decoration:none;font-size:13px;white-space:nowrap}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#888}.dot.on{background:#22c55e}
+
+.vmwin{position:fixed;right:10px;bottom:70px;width:min(420px,calc(100vw - 20px));max-height:60vh;display:flex;flex-direction:column;z-index:50;background:#0b0f17;border:1px solid #2a3750;border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.5);overflow:hidden}
+.vmwin-h{display:flex;align-items:center;gap:6px;padding:8px 10px;border-bottom:1px solid #1d2636}
+.vmwin-h button{background:#1a2333;color:inherit;border:1px solid #2a3750;border-radius:7px;min-width:30px;min-height:28px;font-size:16px;line-height:1;padding:0 8px}
+.vmwin-b{padding:8px;overflow:hidden;display:flex;min-height:0}.vmwin-b .live{max-height:none;height:min(38vh,320px);width:100%}
+.vmwin.min .vmwin-b{display:none}
+.secondary{background:#1a2333;color:inherit;border:1px solid #2a3750}

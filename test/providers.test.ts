@@ -444,12 +444,13 @@ test("guest safety: cap on guest accounts, rate limit, POST-only creation, off w
   try { assert.equal((await fetch(`${gh.base}/auth/guest`, { method: "POST" })).status, 403, "a server with GitHub OAuth must not allow guests by default"); } finally { await gh.stop(); }
 });
 
-test("guest safety: dangerous commands are blocked or need approval for guests too, and keys stay per-guest", async () => {
+test("guest safety: dangerous commands are blocked and deletes need approval for guests too, installs run freely, and keys stay per-guest", async () => {
   const c = await bootGuest();
   try {
     const A = await guestToken(c); const B = await guestToken(c); await vmForToken(c.app, A.token); const client = await mcpClient({ base: c.base } as any, A.token);
     const bad = ["rm", "-rf", " /"].join(""); const r1 = await client.callTool({ name: "run_command", arguments: { command: bad } }) as any; assert.equal(r1.isError, true, "destructive command must not run: " + text(r1));
-    const inst = await client.callTool({ name: "run_command", arguments: { command: "npm install left-pad" } }) as any; assert.ok(/approval/i.test(text(inst)), "installs must wait for approval: " + text(inst));
+    const inst = await client.callTool({ name: "run_command", arguments: { command: "npm --version" } }) as any; assert.ok(!/approval_required/i.test(text(inst)), "ordinary commands run without approval: " + text(inst));
+    const del = await client.callTool({ name: "run_command", arguments: { command: "rm somefile.txt" } }) as any; assert.ok(/approval_required/i.test(text(del)), "deletes must wait for approval: " + text(del));
     const H = { cookie: A.cookie, "x-csrf-token": A.me.csrf, "content-type": "application/json" };
     assert.equal((await fetch(`${c.base}/api/providers`, { method: "POST", headers: H, body: JSON.stringify({ id: "hetzner", key: KEY }) })).status, 200);
     assert.equal(c.app.pvault.has(A.me.user.userId, "hetzner"), true); assert.equal(c.app.pvault.has(B.me.user.userId, "hetzner"), false, "another guest must not have this guest's key");

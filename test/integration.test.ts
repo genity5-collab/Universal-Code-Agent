@@ -253,3 +253,52 @@ test("GitHub sign-in failure (e.g. wrong client secret) never strands ChatGPT: g
     assert.equal(gu.status, 302); assert.match(gu.headers.get("location")!, /\/authorize\/consent/);
   } finally { await c.stop(); }
 });
+
+test("LIVE VM WINDOW in ChatGPT: vm_live opens an inline widget, the window can poll through the host bridge, the model never sees the poll tool, and nothing leaks", async () => {
+  const c = await boot();
+  try {
+    const f = await oauthFlow(c); const tok = await getToken(c, f); await vmForToken(c.app, tok.access_token); const client = await mcpClient(c, tok.access_token);
+    const tools = (await client.listTools()).tools as any[];
+    // the model-facing tool links to the widget with both the standard and the ChatGPT alias
+    const live = tools.find((t) => t.name === "vm_live"); assert.ok(live, "vm_live is offered");
+    assert.equal(live._meta?.ui?.resourceUri, "ui://widget/vm-live-v1.html"); assert.equal(live._meta?.["openai/outputTemplate"], "ui://widget/vm-live-v1.html");
+    // the poll tool is for the window only: it must be flagged app-only so hosts hide it from the model
+    const poll = tools.find((t) => t.name === "vm_live_poll"); assert.ok(poll, "the host needs to see it to forward the window's calls");
+    assert.deepEqual(poll._meta?.ui?.visibility, ["app"]);
+    // the widget resource is served as an MCP App, is self-contained and declares no network access
+    const res = await client.readResource({ uri: "ui://widget/vm-live-v1.html" }) as any; const item = res.contents[0];
+    assert.equal(item.mimeType, "text/html;profile=mcp-app"); assert.match(item.text, /ui\/initialize/); assert.match(item.text, /vm_live_poll/);
+    assert.deepEqual(item._meta?.ui?.csp?.connectDomains, [], "no network access"); assert.deepEqual(item._meta?.ui?.csp?.resourceDomains, []);
+    assert.ok(!/https?:\/\//.test(item.text.replace(/https?:\/\/(www\.)?w3\.org[^"' ]*/g, "")), "the window makes no external requests");
+    assert.ok(!/innerHTML\s*=|insertAdjacentHTML|document\.write|eval\(/.test(item.text), "feed text is only ever inserted as text");
+
+    // do some real work in the VM, including something secret-looking, then open the window
+    await client.callTool({ name: "run_command", arguments: { command: "echo hello-live" } });
+    await client.callTool({ name: "create_file", arguments: { path: "notes/a.txt", content: "x" } });
+    await client.callTool({ name: "run_command", arguments: { command: "echo ghp_" + "A".repeat(36) } });
+    const r = await client.callTool({ name: "vm_live", arguments: {} }) as any;
+    assert.ok(!r.isError); assert.match(r.content[0].text, /Live VM window opened/);
+    const s = r.structuredContent; assert.equal(s.running, true); assert.ok(s.items.some((i: any) => /echo hello-live/.test(i.summary)), "recent actions are in the window");
+    assert.ok(s.files.some((x: any) => x.name === "notes/a.txt" || x.name === "notes"), "files are listed");
+    assert.ok(!JSON.stringify(s).includes("A".repeat(36)), "secrets are redacted before they reach the window");
+
+    // the window refreshes with only what is new
+    const since = s.lastId; await client.callTool({ name: "run_command", arguments: { command: "echo second-step" } });
+    const p = await client.callTool({ name: "vm_live_poll", arguments: { sinceId: since, files: false } }) as any;
+    assert.equal(p.structuredContent.items.length >= 1, true); assert.ok(p.structuredContent.items.every((i: any) => i.id > since), "no repeats"); assert.ok(p.structuredContent.items.some((i: any) => /second-step/.test(i.summary)));
+    // polling is read-only: it adds nothing to the activity log
+    const n1 = (await client.callTool({ name: "vm_live_poll", arguments: { sinceId: 0 } }) as any).structuredContent.items.length; const n2 = (await client.callTool({ name: "vm_live_poll", arguments: { sinceId: 0 } }) as any).structuredContent.items.length; assert.equal(n1, n2);
+    // bad input is refused, not crashed on
+    const bad = await client.callTool({ name: "vm_live_poll", arguments: { sinceId: "no" } }) as any; assert.equal(bad.isError, true);
+    await client.close();
+  } finally { await c.stop(); }
+});
+
+test("live window without a VM: says so in text instead of failing, and users cannot see each other's activity", async () => {
+  const c = await boot();
+  try {
+    const f = await oauthFlow(c); const tok = await getToken(c, f); const client = await mcpClient(c, tok.access_token);
+    const r = await client.callTool({ name: "vm_live", arguments: {} }) as any; assert.ok(!r.isError); assert.match(r.content[0].text, /not running|vm_start/i); assert.equal(r.structuredContent.running, false); assert.deepEqual(r.structuredContent.items, []);
+    await client.close();
+  } finally { await c.stop(); }
+});

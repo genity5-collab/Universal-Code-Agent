@@ -17,9 +17,11 @@
   async function drawVm() {
     const box = $("#vmbox"); let s; try { s = await api("/vm"); } catch (e) { box.innerHTML = `<span class="err">${esc(e.message)}</span>`; return; }
     if (!s.hasKey) { box.innerHTML = `<p><b>No VM yet.</b> The AI cannot read, write or run anything until you add an InstaBox key.</p><ol class="muted"><li>Create an API key at <a href="https://dashboard.instabox.sh/dashboard/api-keys" target="_blank" rel="noopener">instabox.sh</a> with machines read, write and delete.</li><li>Open <b>Cloud</b>, then <b>Provider keys</b>, choose <b>InstaBox</b> and paste it.</li><li>Come back here and press Start VM.</li></ol><p class="muted">The key is kept in server memory only and your AI never sees it.</p>`; return; }
-    if (!s.running) { box.innerHTML = `<p>Key added. <b>No VM is running.</b></p><button id="vmstart">Start VM</button> <span id="vmmsg" class="muted"></span>`;
+    if (!s.running) { box.innerHTML = `<p>Key added. <b>No VM is running.</b></p><button id="vmstart">Start VM</button> <button id="vmwin" class="secondary" type="button">Live window</button> <span id="vmmsg" class="muted"></span>`;
+      $("#vmwin").onclick = openWindow;
       $("#vmstart").onclick = async () => { $("#vmstart").disabled = true; $("#vmmsg").textContent = "Starting..."; try { await api("/vm/start", { method: "POST", body: {} }); workspaceTab(); } catch (e) { $("#vmstart").disabled = false; $("#vmmsg").innerHTML = `<span class="err">${esc(e.message)}</span>`; } }; return; }
-    box.innerHTML = `<p><span class="dot on"></span> <b>VM running</b> <span class="muted">${esc(s.machineId || "")}</span></p><button id="vmstop" class="danger">Stop VM</button><p class="muted">Stopping deletes the files inside it. Download what you need first.</p>`;
+    box.innerHTML = `<p><span class="dot on"></span> <b>VM running</b> <span class="muted">${esc(s.machineId || "")}</span></p><button id="vmwin" class="secondary" type="button">Live window</button> <button id="vmstop" class="danger">Stop VM</button><p class="muted">Stopping deletes the files inside it. Download what you need first.</p>`;
+    $("#vmwin").onclick = openWindow;
     $("#vmstop").onclick = async () => { if (confirm("Stop the VM? Files inside it will be lost.")) { await api("/vm/stop", { method: "POST", body: {} }); workspaceTab(); } };
   }
 
@@ -40,6 +42,29 @@
       if (d.kind === "vm") drawVm();
     };
     es.onerror = () => { /* the browser reconnects by itself */ };
+  }
+
+
+  /* Floating "Live VM window": stays on top on every tab, shows the same stream, closes with the X. */
+  let wes = null;
+  function closeWindow() { if (wes) { wes.close(); wes = null; } const w = document.getElementById("vmlivewin"); if (w) w.remove(); }
+  window.closeVmWindow = closeWindow;
+  function openWindow() {
+    if (document.getElementById("vmlivewin")) return;
+    const w = document.createElement("div"); w.id = "vmlivewin"; w.className = "vmwin"; w.setAttribute("role", "dialog"); w.setAttribute("aria-label", "Live VM window");
+    w.innerHTML = `<div class="vmwin-h"><span class="dot on"></span><b>Live VM</b><span class="grow"></span><button type="button" id="vmwin-min" aria-label="Minimise">_</button><button type="button" id="vmwin-x" aria-label="Close">&times;</button></div><div class="vmwin-b"><div id="vmwin-live" class="live" role="log" aria-live="polite"><span class="muted">Waiting for the AI to act...</span></div></div>`;
+    document.body.appendChild(w);
+    const box = w.querySelector("#vmwin-live"); let empty = true;
+    w.querySelector("#vmwin-x").onclick = closeWindow;
+    w.querySelector("#vmwin-min").onclick = () => w.classList.toggle("min");
+    wes = new EventSource("/api/activity/stream");
+    wes.onmessage = (ev) => {
+      let d; try { d = JSON.parse(ev.data); } catch { return; }
+      if (d.hello) { if (d.items.length) { box.innerHTML = d.items.map(line).join(""); empty = false; } box.scrollTop = box.scrollHeight; return; }
+      if (empty) { box.innerHTML = ""; empty = false; }
+      box.insertAdjacentHTML("beforeend", line(d)); box.scrollTop = box.scrollHeight;
+      while (box.children.length > 150) box.removeChild(box.firstChild);
+    };
   }
 
   async function loadFiles(path) {

@@ -38,6 +38,8 @@ export interface ToolDef {
   shape: z.ZodRawShape;
   readOnly: boolean;
   destructive?: boolean;
+  /** Optional tool _meta (e.g. a UI widget link). */
+  meta?: Record<string, unknown>;
   handler: (args: any, ctx: UserContext, deps: ToolDeps) => Promise<unknown>;
 }
 
@@ -268,11 +270,9 @@ export const TOOLS: ToolDef[] = [
 ];
 
 /** Execute a tool with rate limiting, audit and uniform error mapping. */
-/** Tools that always need a human OK, with the text the human sees. Must stay in step with the originals' needApproval calls (a test enforces it). */
+/** In the user's own VM only DELETES need a human OK (installs, pushes, risky commands run automatically). Text is what the human sees. */
 export const VM_APPROVAL: Record<string, (a: any) => string> = {
   delete_file: (a) => `Delete ${a.path}${a.recursive ? " (recursive)" : ""}`,
-  install_dependencies: (a) => `Install dependencies in ${a.cwd ?? "."}`,
-  git_push: (a) => `Push ${a.branch ?? "current branch"} to ${a.remote ?? "origin"}`,
 };
 
 export async function runTool(def: ToolDef, args: unknown, ctx: UserContext, deps: ToolDeps): Promise<ToolResult> {
@@ -290,6 +290,11 @@ export async function runTool(def: ToolDef, args: unknown, ctx: UserContext, dep
       out = await VM_HANDLERS[def.name](parsed.data, ctx, deps, { mgr: deps.vm, feed: deps.feed });
     } else out = await def.handler(parsed.data, ctx, deps);
     deps.audit.write({ userId: ctx.userId, tool: def.name, ok: true });
+    if (out && typeof out === "object" && "__structured" in (out as any)) {
+      const o = out as { __structured: unknown; text?: string };
+      const clean = (v: unknown) => JSON.parse(deps.vault ? deps.vault.scrubAll(ctx.userId, redact(JSON.stringify(v ?? null))) : redact(JSON.stringify(v ?? null)));
+      return { content: [{ type: "text", text: String(o.text ?? "ok") }], structuredContent: clean(o.__structured) } as any;
+    }
     return ok(JSON.parse(deps.vault ? deps.vault.scrubAll(ctx.userId, redact(JSON.stringify(out ?? null))) : redact(JSON.stringify(out ?? null))));
   } catch (e: any) {
     if (e instanceof ApprovalNeeded) {

@@ -106,7 +106,7 @@ test("dangerous commands are blocked or need approval INSIDE the VM too; blocked
   const b = await boot(); try {
     const u = await asUser(b); u.deps.vault.put("guest:tester", { id: "instabox", label: "I", hosts: ["api.instabox.sh"], auth: { type: "header", name: "X-API-Key" } }, KEY); await u.call("vm_start", {});
     const bad = ["rm", "-rf", " /"].join(""); let r = await u.call("run_command", { command: bad }); assert.equal(r.isError, true); assert.match(text(r), /Blocked/i);
-    r = await u.call("run_command", { command: "npm install left-pad" }); assert.match(text(r), /approval/i);
+    r = await u.call("run_command", { command: "npm --version" }); assert.ok(!(JSON.parse(text(r)).status === "approval_required"), "ordinary commands run with no approval");
     assert.ok(u.deps.feed.list("guest:tester").some((a: any) => a.kind === "command" && a.ok === false && /Blocked/.test(a.output ?? "")), "blocked attempt is visible in the live feed");
     assert.equal([...b.vmf.sessions.values()].length, 1);
   } finally { await b.stop(); }
@@ -241,29 +241,64 @@ test("Workspace over real HTTP: key via the app, start VM, AI acts through MCP, 
   } finally { await b.stop(); }
 });
 
-test("APPROVALS SURVIVE THE VM GATE: delete, install, push and risky jobs/commands still wait for a human, and the VM is untouched until approved", async () => {
+test("ONLY DELETES NEED A HUMAN: installs, pushes, risky commands and jobs run automatically; every kind of delete still waits; hard blocks stay blocked", async () => {
   const b = await boot(); try {
     assert.equal(b.config.requireApproval, true);
     const u = await asUser(b); u.deps.vault.put("guest:tester", { id: "instabox", label: "I", hosts: ["api.instabox.sh"], auth: { type: "header", name: "X-API-Key" } }, KEY); await u.call("vm_start", {});
     await u.call("create_file", { path: "victim.txt", content: "keep me" });
-    const need = async (name: string, args: any) => { const r = await u.call(name, args); assert.equal(r.isError, true, `${name} must not run unapproved`); const j = JSON.parse(text(r)); assert.equal(j.status, "approval_required", name); return j; };
+    const needsHuman = (r: any) => { try { return JSON.parse(text(r)).status === "approval_required"; } catch { return false; } };
+    const need = async (name: string, args: any) => { const r = await u.call(name, args); assert.equal(r.isError, true, `${name} ${JSON.stringify(args)} must not run unapproved`); assert.ok(needsHuman(r), `${name} ${JSON.stringify(args)} must ask the user`); return JSON.parse(text(r)); };
+    const free = async (name: string, args: any) => { const r = await u.call(name, args); assert.ok(!needsHuman(r), `${name} ${JSON.stringify(args)} must NOT ask the user: ${text(r).slice(0, 160)}`); return r; };
+
+    // 1. things that used to ask now run on their own
+    await free("install_dependencies", {}); await free("git_push", {}); await free("git_pull", {}); await free("git_clone", { url: "https://example.invalid/x.git" });
+    for (const command of ["npm install left-pad", "python3 -c print(1)", "node -e 1", "git init", "make", "touch made.txt", "mkdir -p sub"]) await free("run_command", { command });
+    await free("start_job", { command: "npm install left-pad" });
+
+    // 2. every form of delete still waits for a human, and nothing is deleted before approval
     const del = await need("delete_file", { path: "victim.txt" });
     assert.match(text(await u.call("read_file", { path: "victim.txt" })), /keep me/, "file must still exist before approval");
-    await need("install_dependencies", {}); await need("git_push", {}); await need("run_command", { command: "npm install left-pad" }); await need("start_job", { command: "npm install left-pad" });
+    await need("run_command", { command: "rm victim.txt" }); await need("run_command", { command: "rm -r sub" }); await need("run_command", { command: "rm -rf sub" }); await need("run_command", { command: "rmdir sub" });
+    await need("run_command", { command: "git clean -fd" }); await need("run_command", { command: "git reset --hard" }); await need("run_command", { command: "git branch -D old" });
+    await need("start_job", { command: "rm victim.txt" });
+    assert.match(text(await u.call("read_file", { path: "victim.txt" })), /keep me/, "still there after all the refused delete attempts");
+
+    // 3. hard blocks are never relaxed
+    for (const command of ["sudo ls", ["rm", "-rf", " /"].join(""), "rm -rf ../x", "rm -rf *"]) { const r = await u.call("run_command", { command }); assert.equal(r.isError, true, command); assert.ok(!needsHuman(r), command + " is blocked, not merely asked"); assert.match(text(r), /Blocked/i, command); }
+
+    // 4. approving a delete works once and is single use
     assert.equal(u.deps.approvals.decide("guest:tester", del.approvalId, true), true);
     const after = await u.call("delete_file", { path: "victim.txt" }); assert.ok(!after.isError, text(after));
     assert.equal((await u.call("read_file", { path: "victim.txt" })).isError, true, "deleted after approval");
-    assert.equal((await u.call("delete_file", { path: "victim.txt" })).isError, true, "approval is single use");
+    await u.call("create_file", { path: "victim.txt", content: "again" });
+    assert.ok(needsHuman(await u.call("delete_file", { path: "victim.txt" })), "approval is single use");
   } finally { await b.stop(); }
 });
 
-test("every tool that needed approval before the VM change still does (no silent regression)", async () => {
-  const src = fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../src/mcp/tools.ts"), "utf8");
-  const original = [...src.matchAll(/needApproval\(c, d, "([a-z_]+)"/g)].map((m) => m[1]);
-  const { VM_APPROVAL } = await import("../src/mcp/tools.js"); const { GATED_TOOLS } = await import("../src/instabox/tools.js");
-  for (const name of original) { if (!GATED_TOOLS.has(name)) continue; if (name === "run_command" || name === "start_job") continue; assert.ok(VM_APPROVAL[name], `${name} needs approval in its original handler but nothing asks for it in the VM path`); }
+test("a denied delete never runs", async () => {
+  const b = await boot(); try {
+    const u = await asUser(b); u.deps.vault.put("guest:tester", { id: "instabox", label: "I", hosts: ["api.instabox.sh"], auth: { type: "header", name: "X-API-Key" } }, KEY); await u.call("vm_start", {});
+    await u.call("create_file", { path: "keep.txt", content: "precious" });
+    const j = JSON.parse(text(await u.call("delete_file", { path: "keep.txt" }))); assert.equal(u.deps.approvals.decide("guest:tester", j.approvalId, false), true);
+    const r = await u.call("delete_file", { path: "keep.txt" }); assert.equal(r.isError, true);
+    assert.match(text(await u.call("read_file", { path: "keep.txt" })), /precious/);
+  } finally { await b.stop(); }
 });
 
+test("the central approval list contains exactly the delete tool (nothing else silently asks, nothing destructive is missing)", async () => {
+  const { VM_APPROVAL } = await import("../src/mcp/tools.js");
+  assert.deepEqual(Object.keys(VM_APPROVAL), ["delete_file"]);
+  const { needsHumanInVm } = await import("../src/instabox/tools.js");
+  const ap = (reason: string, argv: string[]) => ({ decision: "approval", reason, argv });
+  assert.equal(needsHumanInVm(ap("file deletion inside the workspace", ["rm", "a"])), true);
+  assert.equal(needsHumanInVm(ap("git branch deletion/rename", ["git", "branch", "-D", "x"])), true);
+  assert.equal(needsHumanInVm(ap("git reset discards workspace changes", ["git", "reset", "--hard"])), true);
+  assert.equal(needsHumanInVm(ap("git clean changes repository state", ["git", "clean", "-fd"])), true);
+  assert.equal(needsHumanInVm(ap("npm install mutates the project or network", ["npm", "install"])), false);
+  assert.equal(needsHumanInVm(ap("git push changes repository state", ["git", "push"])), false);
+  assert.equal(needsHumanInVm({ decision: "allow", reason: "x", argv: ["rm", "a"] }), false, "only the approval tier is ever relaxed or asked");
+  assert.equal(needsHumanInVm({ decision: "deny", reason: "x", argv: ["rm", "a"] }), false, "deny is handled (blocked) elsewhere and never turns into an ask");
+});
 
 test("find_symbol keeps the original result shape: an array of {name, kind, line, path, language}; kind and fuzzy work", async () => {
   const b = await boot(); try {

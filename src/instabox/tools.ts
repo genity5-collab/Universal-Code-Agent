@@ -25,6 +25,19 @@ export function vmPath(p: string): string {
   return abs;
 }
 
+/**
+ * Inside the user's own VM the AI works freely: the policy's "approval" tier (installs, git writes, npm/python/make, unknown commands...)
+ * runs automatically. Only DELETES (and actions that throw away work) still wait for a human. Hard "deny" is never relaxed.
+ */
+export const DELETE_REASON = /\b(delet|remov|discards? workspace changes|git clean)/i;
+export function needsHumanInVm(pol: { decision: string; reason?: string; argv?: string[] }): boolean {
+  if (pol.decision !== "approval") return false;
+  const argv = pol.argv ?? []; const head = (argv[0] ?? "").split("/").pop();
+  if (head === "rm" || head === "rmdir" || head === "unlink" || head === "shred") return true;
+  if (head === "git" && argv.slice(1).includes("clean")) return true;
+  return DELETE_REASON.test(pol.reason ?? "");
+}
+
 export const GATED_TOOLS = new Set(["read_file","read_file_chunk","read_file_range","write_file","create_file","edit_file","delete_file","list_directory","search_files","search_content","find_symbol","get_file_metadata","compare_files","index_repo","repo_map","dependency_map","change_tracking","run_command","start_job","job_status","job_output","stop_job","list_jobs","read_command_log","install_dependencies","run_tests","format_code","static_analysis","build_verify","git_status","git_diff","git_log","git_branch_create","git_checkout","git_commit","git_clone","git_push","git_pull"]);
 
 type H = (a: any, ctx: UserContext, deps: ToolDeps, vm: VmEnv) => Promise<unknown>;
@@ -91,7 +104,7 @@ export const VM_HANDLERS: Record<string, H> = {
   run_command: async (a, c, d, e) => {
     const cmd = String(a.command ?? ""); const pol = evaluateCommand(cmd, { root: WORKSPACE_DIR });
     if (pol.decision === "deny") { e.feed.add(c.userId, { tool: "run_command", kind: "command", summary: `$ ${cmd}`, ok: false, output: `Blocked: ${pol.reason}` }); throw new Error(`Blocked: ${pol.reason}`); }
-    if (pol.decision === "approval" && d.config.requireApproval) { const r = d.approvals.check(c.userId, "run_command", cmd); if (r.state === "denied") throw new Error("The user denied this command."); if (r.state !== "approved") { const { ApprovalNeeded } = await import("../mcp/tools.js"); throw new ApprovalNeeded(r.id, `run_command: ${cmd}`); } }
+    if (needsHumanInVm(pol) && d.config.requireApproval) { const r = d.approvals.check(c.userId, "run_command", cmd); if (r.state === "denied") throw new Error("The user denied this command."); if (r.state !== "approved") { const { ApprovalNeeded } = await import("../mcp/tools.js"); throw new ApprovalNeeded(r.id, `run_command: ${cmd}`); } }
     const t0 = Date.now(); const dir = a.cwd ? vmPath(a.cwd) : WORKSPACE_DIR; const r = await e.mgr.exec(c.userId, `mkdir -p ${shq(dir)} && cd ${shq(dir)} && ${cmd}`, { timeoutSec: Math.min(Math.ceil((a.timeoutMs ?? 60000) / 1000), 600) });
     e.feed.add(c.userId, { tool: "run_command", kind: "command", summary: `$ ${cmd}`, ok: !r.exitCode, output: (r.stdout + (r.stderr ? "\n" + r.stderr : "")).slice(0, 4000), ms: Date.now() - t0 });
     return { exitCode: r.exitCode, stdout: r.stdout.slice(0, 100_000), stderr: r.stderr.slice(0, 20_000), ranIn: "vm" };
@@ -113,7 +126,7 @@ const script = (tool: string, build: (a: any) => string, approval?: (a: any) => 
 const q = (v: unknown) => shq(String(v));
 const refOk = (v: unknown, what: string) => { if (!/^[A-Za-z0-9._\/-]{1,200}$/.test(String(v)) || String(v).startsWith("-")) throw new Error(`Invalid ${what}.`); return String(v); };
 Object.assign(VM_HANDLERS, {
-  install_dependencies: script("install_dependencies", () => "if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; elif [ -f requirements.txt ]; then pip install -r requirements.txt; else echo nothing to install; fi", () => "install project dependencies"),
+  install_dependencies: script("install_dependencies", () => "if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; elif [ -f requirements.txt ]; then pip install -r requirements.txt; else echo nothing to install; fi", ),
   run_tests: script("run_tests", (a) => `if [ -f package.json ]; then npm test --silent -- ${(a.extraArgs ?? []).map(q).join(" ")}; elif [ -f pytest.ini ] || [ -d tests ]; then python -m pytest -q ${(a.extraArgs ?? []).map(q).join(" ")}; else echo no tests found; fi`),
   format_code: script("format_code", () => "if [ -f package.json ]; then npx --no-install prettier --write . ; else echo no formatter configured; fi"),
   static_analysis: script("static_analysis", () => "if [ -f tsconfig.json ]; then npx --no-install tsc --noEmit; elif [ -f package.json ]; then npx --no-install eslint . ; else python -m pyflakes . 2>&1 | head -50; fi"),
@@ -124,10 +137,10 @@ Object.assign(VM_HANDLERS, {
   git_branch_create: script("git_branch_create", (a) => `git switch -c ${q(refOk(a.name, "branch name"))} ${a.startPoint ? q(refOk(a.startPoint, "start point")) : ""}`),
   git_checkout: script("git_checkout", (a) => `git switch ${a.create ? "-c" : ""} ${q(refOk(a.target, "target"))}`),
   git_commit: script("git_commit", (a) => `${a.paths?.length ? "git add -- " + a.paths.map((x: string) => q(vmPath(x).slice(WORKSPACE_DIR.length + 1) || ".")).join(" ") : "git add -A"} && git -c user.name=AI -c user.email=ai@example.invalid commit -m ${q(a.message)}`),
-  git_clone: script("git_clone", (a) => `git clone -- ${q(a.url)} ${a.dir ? q(vmPath(a.dir).slice(WORKSPACE_DIR.length + 1)) : ""}`, (a) => `clone ${a.url}`),
-  git_pull: script("git_pull", (a) => `git pull --ff-only ${a.remote ? q(refOk(a.remote, "remote")) : ""} ${a.branch ? q(refOk(a.branch, "branch")) : ""}`, () => "pull from remote"),
-  git_push: script("git_push", (a) => `git push ${a.setUpstream ? "-u" : ""} ${a.remote ? q(refOk(a.remote, "remote")) : ""} ${a.branch ? q(refOk(a.branch, "branch")) : ""}`, (a) => `push ${a.remote ?? "origin"} ${a.branch ?? ""}`.trim()),
-  start_job: async (a, c, d, e) => { const pol = evaluateCommand(String(a.command ?? ""), { root: WORKSPACE_DIR }); if (pol.decision === "deny") throw new Error(`Blocked: ${pol.reason}`); if (pol.decision === "approval" && d.config.requireApproval) { const r = d.approvals.check(c.userId, "start_job", String(a.command)); if (r.state === "denied") throw new Error("The user denied this command."); if (r.state !== "approved") { const { ApprovalNeeded } = await import("../mcp/tools.js"); throw new ApprovalNeeded(r.id, "start_job"); } } const id = "j" + Date.now().toString(36); await runScript("start_job", `mkdir -p /tmp/uca_jobs && (nohup sh -c ${q(a.command)} > /tmp/uca_jobs/${id}.log 2>&1 & echo $! > /tmp/uca_jobs/${id}.pid)`, a, c, d, e, pol.decision === "approval" ? String(a.command) : undefined); return { jobId: id, started: true }; },
+  git_clone: script("git_clone", (a) => `git clone -- ${q(a.url)} ${a.dir ? q(vmPath(a.dir).slice(WORKSPACE_DIR.length + 1)) : ""}`),
+  git_pull: script("git_pull", (a) => `git pull --ff-only ${a.remote ? q(refOk(a.remote, "remote")) : ""} ${a.branch ? q(refOk(a.branch, "branch")) : ""}`),
+  git_push: script("git_push", (a) => `git push ${a.setUpstream ? "-u" : ""} ${a.remote ? q(refOk(a.remote, "remote")) : ""} ${a.branch ? q(refOk(a.branch, "branch")) : ""}`),
+  start_job: async (a, c, d, e) => { const pol = evaluateCommand(String(a.command ?? ""), { root: WORKSPACE_DIR }); if (pol.decision === "deny") throw new Error(`Blocked: ${pol.reason}`); if (needsHumanInVm(pol) && d.config.requireApproval) { const r = d.approvals.check(c.userId, "start_job", String(a.command)); if (r.state === "denied") throw new Error("The user denied this command."); if (r.state !== "approved") { const { ApprovalNeeded } = await import("../mcp/tools.js"); throw new ApprovalNeeded(r.id, "start_job"); } } const id = "j" + Date.now().toString(36); await runScript("start_job", `mkdir -p /tmp/uca_jobs && (nohup sh -c ${q(a.command)} > /tmp/uca_jobs/${id}.log 2>&1 & echo $! > /tmp/uca_jobs/${id}.pid)`, a, c, d, e); return { jobId: id, started: true }; },
   job_status: async (a, c, _d, e) => { const id = jobId(a.jobId); const r = await e.mgr.exec(c.userId, `kill -0 $(cat /tmp/uca_jobs/${id}.pid 2>/dev/null) 2>/dev/null && echo running || echo finished`); return { jobId: id, status: r.stdout.trim() }; },
   job_output: async (a, c, _d, e) => { const id = jobId(a.jobId); const off = Math.max(0, Number(a.offset ?? 0) | 0), lim = Math.min(Math.max(1, Number(a.limit ?? 20000) | 0), 200000); const r = await e.mgr.exec(c.userId, `tail -c +${off + 1} /tmp/uca_jobs/${id}.log 2>/dev/null | head -c ${lim}`); return { jobId: id, offset: off, output: r.stdout, nextOffset: off + Buffer.byteLength(r.stdout) }; },
   stop_job: async (a, c, _d, e) => { const id = jobId(a.jobId); await e.mgr.exec(c.userId, `kill $(cat /tmp/uca_jobs/${id}.pid 2>/dev/null) 2>/dev/null; true`); return { jobId: id, stopped: true }; },
