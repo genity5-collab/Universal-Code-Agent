@@ -226,7 +226,14 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
         sessions.destroySession(cookies);
         const s = sessions.createSession(userId, { userAgent: String(req.headers["user-agent"] ?? ""), ip: ip(req) });
         return redirect(res, chk.redirectTo ?? "/", { "set-cookie": s.cookie });
-      } catch (e: any) { return send(res, 502, `<h1>GitHub login failed</h1><p>${escHtml(redact(String(e?.message ?? e)))}</p>`); }
+      } catch (e: any) {
+        // Never strand the user on a dead end: explain, and for an in-progress AI connection offer the guest route again.
+        const m2 = /pending=([^&]+)/.exec(chk.redirectTo ?? ""); const pid = m2 ? decodeURIComponent(m2[1]) : "";
+        const pend = pid ? store.getPending(pid) : null;
+        const guestForm = pend && pend.expiresAt > Date.now() && config.allowGuests ? `<form method=post action="/authorize/guest"><input type=hidden name=pending value="${escHtml(pid)}"><button>Continue as guest instead</button></form>` : "";
+        const retry = pend && pend.expiresAt > Date.now() ? `<p><a href="/authorize/choose?pending=${encodeURIComponent(pid)}">Back to the sign-in options</a></p>` : `<p><a href="/">Back to the app</a></p>`;
+        return send(res, 502, `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>GitHub sign-in failed</title><style>body{font:16px system-ui;background:#0b0f17;color:#e6edf6;max-width:520px;margin:0 auto;padding:20px}button{font:inherit;padding:14px 18px;border-radius:10px;border:0;background:#4f8cff;color:#fff;min-height:48px}a{color:#8db4ff}</style><h2>GitHub sign-in failed</h2><p>${escHtml(redact(String(e?.message ?? e)))}</p><p>This usually means the server's GitHub app settings (client ID and secret) do not match. The site owner needs to fix them.</p>${guestForm}${retry}`);
+      }
     }
 
 

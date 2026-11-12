@@ -228,3 +228,26 @@ test("dashboard API requires a session; tokens never appear in responses; static
     const trav = await fetch(`${c.base}/..%2f..%2fpackage.json`); assert.notEqual(trav.status, 200);
   } finally { await c.stop(); }
 });
+
+test("GitHub sign-in failure (e.g. wrong client secret) never strands ChatGPT: guest route still completes", async () => {
+  const c = await boot({ UCA_ALLOW_GUESTS: "true" });
+  try {
+    const reg = await (await fetch(`${c.base}/oauth/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "ChatGPT", redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"], token_endpoint_auth_method: "none", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }) })).json() as any;
+    const verifier = b64u(crypto.randomBytes(48)); const challenge = b64u(crypto.createHash("sha256").update(verifier).digest());
+    const q = new URLSearchParams({ response_type: "code", client_id: reg.client_id, redirect_uri: "https://chatgpt.com/connector_platform_oauth_redirect", code_challenge: challenge, code_challenge_method: "S256", scope: "mcp:read mcp:write", state: "s", resource: `${c.base}/mcp` });
+    const a = await fetch(`${c.base}/oauth/authorize?${q}`, { redirect: "manual" });
+    const choose = await fetch(new URL(a.headers.get("location")!, c.base), { redirect: "manual" });
+    const pid = /name=pending value="([^"]+)"/.exec(await choose.text())![1];
+    // tap "Sign in with GitHub"
+    const jar = cookieJar();
+    const g = await fetch(`${c.base}/authorize/github?pending=${pid}`, { redirect: "manual" }); jar.absorb(g);
+    const state = new URL(g.headers.get("location")!).searchParams.get("state")!;
+    // GitHub returns a code its token endpoint rejects (what a mismatched secret looks like)
+    const cb = await fetch(`${c.base}/auth/github/callback?code=rejected&state=${encodeURIComponent(state)}`, { redirect: "manual", headers: { cookie: jar.header() } });
+    assert.equal(cb.status, 502); const html = await cb.text();
+    assert.match(html, /GitHub sign-in failed/); assert.match(html, /Continue as guest instead/); assert.match(html, new RegExp(`value="${pid}"`)); assert.ok(!html.includes("gho_"));
+    // the escape hatch works and finishes the connection
+    const gu = await fetch(`${c.base}/authorize/guest`, { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ pending: pid }) });
+    assert.equal(gu.status, 302); assert.match(gu.headers.get("location")!, /\/authorize\/consent/);
+  } finally { await c.stop(); }
+});
