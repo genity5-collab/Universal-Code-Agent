@@ -5,7 +5,16 @@ import { execFileSync } from "node:child_process";
 const realFetch = globalThis.fetch.bind(globalThis);
 export const KEY = "ibk_" + "q".repeat(48);
 /** A fake InstaBox that follows the REAL API (async create + operation polling, exec cmd/cwd, raw file PUT/GET, delete confirmation) and REALLY runs bash. The machine home is a per-machine temp dir mapped onto /data/home. */
+/** Fake X tools: xdotool logs every call to $XLOG; scrot writes a real 4x3 PNG. They only run when DISPLAY=:1 is exported, like the real ones. */
+export function fakeXTools(dir: string) {
+  const bin = path.join(dir, "xbin"); fs.mkdirSync(bin, { recursive: true }); const log = path.join(dir, "xdotool.log");
+  fs.writeFileSync(path.join(bin, "xdotool"), `#!/bin/bash\n[ "$DISPLAY" = ":1" ] || { echo "no display" >&2; exit 1; }\nif [ "$1" = getdisplaygeometry ]; then echo "1280 800"; exit 0; fi\nif [ "$1" = type ]; then echo "type:$(cat)" >> ${log}; exit 0; fi\necho "$*" >> ${log}\n`, { mode: 0o755 });
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAQAAAADCAIAAAA7ljmRAAAAFElEQVR4nGP4z8Dwn4GBgYEBRAAAKB8EAfjB4kQAAAAASUVORK5CYII=", "base64");
+  fs.writeFileSync(path.join(bin, "scrot"), `#!/bin/bash\n[ "$DISPLAY" = ":1" ] || exit 1\nout="\${@: -1}"\nbase64 -d > "$out" <<'EOF'\n${png.toString("base64")}\nEOF\n`, { mode: 0o755 });
+  return { bin, log, readLog: () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8") : "") };
+}
 export function fakeInstaBox() {
+  let xbin = ""; const useX = (b: string) => { xbin = b; };
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fakebox-")); const machines = new Map<string, string>(); const ops = new Map<string, { machineId: string; polls: number }>(); const seen: string[] = []; let n = 0; const idem = new Map<string, string>();
   const map = (dir: string, cmd: string) => cmd.replace(/\/data\/home(?=[\s'"\/;|&)]|$)/g, "\u0001H").replace(/\/tmp\//g, "\u0001T/").replace(/\u0001H/g, path.join(dir, "home")).replace(/\u0001T\//g, path.join(dir, "tmp") + "/");
   const fetchImpl = (async (url: any, init: any = {}) => {
@@ -28,15 +37,21 @@ export function fakeInstaBox() {
       if (sub === "/exec" && method === "POST") {
         const b = JSON.parse(init.body || "{}"); if (typeof b.cmd !== "string") return err(400, "bad_request");
         const cwd = b.cwd ? map(dir, b.cwd) : path.join(dir, "home"); fs.mkdirSync(cwd, { recursive: true });
-        try { const out = execFileSync("bash", ["-c", map(dir, b.cmd)], { cwd, encoding: "utf8", timeout: 20000, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 30 * 1024 * 1024 }); return reply({ stdout: out, stderr: "", exitCode: 0, timedOut: false, truncated: false }); }
+        try { const out = execFileSync("bash", ["-c", map(dir, b.cmd)], { env: { ...process.env, PATH: (xbin ? xbin + ":" : "") + process.env.PATH }, cwd, encoding: "utf8", timeout: 20000, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 30 * 1024 * 1024 }); return reply({ stdout: out, stderr: "", exitCode: 0, timedOut: false, truncated: false }); }
         catch (e: any) { return reply({ stdout: String(e.stdout ?? ""), stderr: String(e.stderr ?? ""), exitCode: e.status ?? 1, timedOut: false, truncated: false }); }
+      }
+      if (sub === "/desktop" && method === "POST") {
+        const b = JSON.parse(init.body || "{}"); const flag = path.join(dir, "desktop.state"); const st = fs.existsSync(flag) ? fs.readFileSync(flag, "utf8") : "none";
+        if (b.action === "install") { fs.writeFileSync(flag, "installed"); return reply({ installed: true, installing: false, running: false }); }
+        if (b.action === "start") { if (st === "none") return reply({ installed: false, running: false }); fs.writeFileSync(flag, "running"); return reply({ installed: true, running: true }); }
+        return reply({ installed: st !== "none", running: st === "running" });
       }
       if (sub === "/files" && method === "PUT") { const p = map(dir, u.searchParams.get("path") ?? ""); if (u.searchParams.get("parents") === "true") fs.mkdirSync(path.dirname(p), { recursive: true }); const buf = Buffer.from(init.body as any); const existed = fs.existsSync(p); fs.writeFileSync(p, buf); return reply({ path: u.searchParams.get("path"), size: buf.length, sha256: "x", mode: "0644", created: !existed }, existed ? 200 : 201); }
       if (sub === "/files/content" && method === "GET") { const p = map(dir, u.searchParams.get("path") ?? ""); if (!fs.existsSync(p) || fs.statSync(p).isDirectory()) return err(404, "not_found"); return new Response(fs.readFileSync(p), { status: 200, headers: { "content-type": "application/octet-stream" } }); }
     }
     return err(404, "not_found", "unknown " + u.pathname);
   }) as unknown as typeof fetch;
-  return { fetchImpl, root, sessions: machines, seen, stop() { fs.rmSync(root, { recursive: true, force: true }); } };
+  return { fetchImpl, root, useX, sessions: machines, seen, stop() { fs.rmSync(root, { recursive: true, force: true }); } };
 }
 
 

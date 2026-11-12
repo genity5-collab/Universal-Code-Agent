@@ -87,6 +87,14 @@ export class InstaBoxManager {
   }
   forget(userId: string): void { this.sessions.delete(userId); }
 
+  /** POST /v1/machines/{id}/<sub> with a JSON body; returns the response body text. */
+  async rawCall(userId: string, method: string, sub: string, body: unknown, timeoutMs = 60_000): Promise<string> {
+    const id = this.require(userId);
+    const r = await this.call(userId, method, `/v1/machines/${encodeURIComponent(id)}/${sub}`, { body, timeoutMs });
+    if (r.status < 200 || r.status >= 300) { try { this.fail(r, "use the desktop"); } catch (e) { if (e instanceof NoVmError) this.sessions.delete(userId); throw e; } }
+    return r.body;
+  }
+
   async exec(userId: string, command: string, opts: { timeoutSec?: number; cwd?: string } = {}): Promise<ExecResult> {
     const id = this.require(userId); const timeout = Math.min(Math.max(1, opts.timeoutSec ?? 60), 600);
     const r = await this.call(userId, "POST", `/v1/machines/${encodeURIComponent(id)}/exec`, { body: { cmd: command, cwd: opts.cwd, timeoutSeconds: timeout }, timeoutMs: Math.min(timeout * 1000 + 5000, 60_000) });

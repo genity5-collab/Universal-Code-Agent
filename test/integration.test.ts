@@ -9,7 +9,7 @@ import type { AddressInfo } from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "../src/util/config.js";
-import { fakeInstaBox, vmForToken } from "./helpers/fakebox.js";
+import { fakeXTools, fakeInstaBox, vmForToken } from "./helpers/fakebox.js";
 import { createApp, type App } from "../src/http/app.js";
 
 // ---- mock GitHub (web + api) on one ephemeral port ----
@@ -53,7 +53,7 @@ async function follow(url: string, jar: ReturnType<typeof cookieJar>, stopAt: (u
   throw new Error("too many redirects");
 }
 
-interface Ctx { app: App; base: string; gh: Awaited<ReturnType<typeof mockGithub>>; tmp: string; stop(): Promise<void> }
+interface Ctx { box: ReturnType<typeof fakeInstaBox>; xlog: () => string; app: App; base: string; gh: Awaited<ReturnType<typeof mockGithub>>; tmp: string; stop(): Promise<void> }
 async function boot(overrides: Record<string, string> = {}): Promise<Ctx> {
   const gh = await mockGithub();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "uca-int-"));
@@ -62,7 +62,8 @@ async function boot(overrides: Record<string, string> = {}): Promise<Ctx> {
   const config = loadConfig({ PORT: String(port), UCA_BASE_URL: `http://127.0.0.1:${port}`, UCA_DATA_DIR: tmp, GITHUB_CLIENT_ID: "cid", GITHUB_CLIENT_SECRET: "csecret", UCA_REQUIRE_APPROVAL: "true", ...overrides } as any);
   const box = fakeInstaBox(); const app = createApp(config, { githubApiBase: gh.url, githubWebBase: gh.url, fetchImpl: box.fetchImpl, instaboxPollMs: 5 } as any);
   await new Promise<void>((r) => app.server.listen(port, "127.0.0.1", () => r()));
-  return { app, base: config.baseUrl, gh, tmp, async stop() { await app.close(); gh.server.close(); box.stop(); fs.rmSync(tmp, { recursive: true, force: true }); } };
+  const xt = fakeXTools(tmp); box.useX(xt.bin);
+  return { box, xlog: xt.readLog, app, base: config.baseUrl, gh, tmp, async stop() { await app.close(); gh.server.close(); box.stop(); fs.rmSync(tmp, { recursive: true, force: true }); } };
 }
 
 /** Run the entire browser-like flow: dynamic registration -> authorize -> GitHub login -> consent -> code -> token. */
@@ -261,12 +262,12 @@ test("LIVE VM WINDOW in ChatGPT: vm_live opens an inline widget, the window can 
     const tools = (await client.listTools()).tools as any[];
     // the model-facing tool links to the widget with both the standard and the ChatGPT alias
     const live = tools.find((t) => t.name === "vm_live"); assert.ok(live, "vm_live is offered");
-    assert.equal(live._meta?.ui?.resourceUri, "ui://widget/vm-live-v1.html"); assert.equal(live._meta?.["openai/outputTemplate"], "ui://widget/vm-live-v1.html");
+    assert.equal(live._meta?.ui?.resourceUri, "ui://widget/vm-live-v2.html"); assert.equal(live._meta?.["openai/outputTemplate"], "ui://widget/vm-live-v2.html");
     // the poll tool is for the window only: it must be flagged app-only so hosts hide it from the model
     const poll = tools.find((t) => t.name === "vm_live_poll"); assert.ok(poll, "the host needs to see it to forward the window's calls");
     assert.deepEqual(poll._meta?.ui?.visibility, ["app"]);
     // the widget resource is served as an MCP App, is self-contained and declares no network access
-    const res = await client.readResource({ uri: "ui://widget/vm-live-v1.html" }) as any; const item = res.contents[0];
+    const res = await client.readResource({ uri: "ui://widget/vm-live-v2.html" }) as any; const item = res.contents[0];
     assert.equal(item.mimeType, "text/html;profile=mcp-app"); assert.match(item.text, /ui\/initialize/); assert.match(item.text, /vm_live_poll/);
     assert.deepEqual(item._meta?.ui?.csp?.connectDomains, [], "no network access"); assert.deepEqual(item._meta?.ui?.csp?.resourceDomains, []);
     assert.ok(!/https?:\/\//.test(item.text.replace(/https?:\/\/(www\.)?w3\.org[^"' ]*/g, "")), "the window makes no external requests");
@@ -299,6 +300,34 @@ test("live window without a VM: says so in text instead of failing, and users ca
   try {
     const f = await oauthFlow(c); const tok = await getToken(c, f); const client = await mcpClient(c, tok.access_token);
     const r = await client.callTool({ name: "vm_live", arguments: {} }) as any; assert.ok(!r.isError); assert.match(r.content[0].text, /not running|vm_start/i); assert.equal(r.structuredContent.running, false); assert.deepEqual(r.structuredContent.items, []);
+    await client.close();
+  } finally { await c.stop(); }
+});
+
+test("LIVE SCREEN in ChatGPT: the window shows the VM's real desktop picture, the screen refresh tool is hidden from the model, and a missing desktop gives a helpful note instead of an error", async () => {
+  const c = await boot();
+  try {
+    const f = await oauthFlow(c); const tok = await getToken(c, f); await vmForToken(c.app, tok.access_token); const client = await mcpClient(c, tok.access_token);
+    const tools = (await client.listTools()).tools as any[];
+    const sp = tools.find((t) => t.name === "vm_screen_poll"); assert.ok(sp); assert.deepEqual(sp._meta?.ui?.visibility, ["app"], "the model never sees the screen refresh tool");
+    for (const n of ["desktop_start", "desktop_screenshot", "desktop_click", "desktop_type", "desktop_press", "desktop_scroll", "desktop_open", "desktop_drag", "desktop_move"]) assert.ok(tools.find((t) => t.name === n), n + " is offered to the AI");
+    assert.equal(tools.find((t) => t.name === "desktop_screenshot").annotations?.readOnlyHint, true);
+    const res = await client.readResource({ uri: "ui://widget/vm-live-v2.html" }) as any; const html = res.contents[0].text;
+    assert.match(html, /vm_screen_poll/); assert.match(html, /id="screen"/); assert.deepEqual(res.contents[0]._meta.ui.csp.connectDomains, []);
+    assert.ok(html.includes('indexOf("data:image/png;base64,")===0'), "the widget accepts only PNG data URLs for the picture"); assert.ok(!/<img[^>]+src="http/i.test(html), "no remote pictures");
+    const script = /<script>([\s\S]*)<\/script>/.exec(html)![1]; assert.doesNotThrow(() => new Function(script), "the widget script, exactly as served, is valid JavaScript");
+
+    // desktop not started yet: the window gets a note, not a crash
+    const before = await client.callTool({ name: "vm_screen_poll", arguments: {} }) as any;
+    assert.ok(!before.isError); assert.ok(before.structuredContent.screen.image || before.structuredContent.screen.note, "either a picture or a short helpful note, never an error");
+    // the AI starts the desktop; now the window gets the real picture
+    const st = await client.callTool({ name: "desktop_start", arguments: {} }) as any; assert.ok(!st.isError, JSON.stringify(st.content));
+    const live = await client.callTool({ name: "vm_live", arguments: {} }) as any; assert.match(live.structuredContent.screen.image, /^data:image\/png;base64,[A-Za-z0-9+/=]+$/); assert.equal(live.structuredContent.screen.width, 4);
+    const p = await client.callTool({ name: "vm_screen_poll", arguments: {} }) as any; const b64 = p.structuredContent.screen.image.split(",")[1]; assert.equal(Buffer.from(b64, "base64").readUInt32BE(0), 0x89504e47, "a real PNG, not a placeholder");
+    // the AI sees the same screen as an image block, and can drive it; the window is read-only and has no input tools
+    const shot = await client.callTool({ name: "desktop_screenshot", arguments: {} }) as any; assert.ok(shot.content.some((x: any) => x.type === "image" && x.mimeType === "image/png"));
+    await client.callTool({ name: "desktop_click", arguments: { x: 7, y: 9 } }); assert.ok(c.xlog().includes("mousemove 7 9 click 1"));
+    const w = html; assert.ok(!/desktop_click|desktop_type|desktop_press/.test(w), "the window cannot click or type");
     await client.close();
   } finally { await c.stop(); }
 });

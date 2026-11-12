@@ -9,10 +9,43 @@
   window.workspaceTab = async function workspaceTab() {
     const view = $("#view"); if (es) { es.close(); es = null; }
     view.innerHTML = `<div class="card"><h2>Workspace</h2><p class="muted">The AI works only inside your VM. Everything it does shows here live, and the files stay in the VM so you can download them.</p><div id="vmbox"></div></div>
-      <div class="card"><h3 style="margin:0 0 8px">Live view</h3><div id="live" class="live" role="log" aria-live="polite"><span class="muted">Waiting for the AI to act...</span></div></div>
+      <div class="card"><h3 style="margin:0 0 8px">VM screen</h3><div id="screenbox"></div></div>
+      <div class="card"><h3 style="margin:0 0 8px">Activity</h3><div id="live" class="live" role="log" aria-live="polite"><span class="muted">Waiting for the AI to act...</span></div></div>
       <div class="card"><h3 style="margin:0 0 8px">Files</h3><div id="use"></div><div id="crumb" class="muted" style="margin:6px 0"></div><div id="files"></div></div>`;
-    await drawVm(); startLive(); loadFiles(".");
+    if (stopScreen) { stopScreen(); stopScreen = null; }
+    await drawVm(); stopScreen = mountScreen($("#screenbox"), { control: true }); startLive(); loadFiles(".");
   };
+
+
+  /* The VM's real desktop: a live picture (refreshed about every 1.5 s), click on it to click in the VM, a box to type, quick keys. */
+  function mountScreen(root, opts) {
+    opts = opts || {}; let stop = false, busy = false, w = 0, h = 0, url = null, timer = null;
+    root.innerHTML = `<div class="scr"><img class="scr-img" alt="Live screen of your VM" hidden><div class="scr-msg muted">Connecting to the VM screen...</div></div>` +
+      (opts.control ? `<div class="scr-ctl"><input class="scr-type" placeholder="Type into the VM, then press Send" aria-label="Text to type"><button type="button" class="scr-send">Send</button><button type="button" data-k="Return">Enter</button><button type="button" data-k="Tab">Tab</button><button type="button" data-k="Escape">Esc</button><button type="button" class="scr-start secondary">Start desktop</button></div>` : "");
+    const img = root.querySelector(".scr-img"), msg = root.querySelector(".scr-msg");
+    async function frame() {
+      if (stop || busy || document.hidden) return; busy = true;
+      try {
+        const r = await fetch("/api/desktop/screen", { credentials: "same-origin", cache: "no-store" });
+        if (!r.ok) { let e = ""; try { e = (await r.json()).error || ""; } catch {} throw new Error(e || "Screen not available"); }
+        w = Number(r.headers.get("x-screen-width")) || 0; h = Number(r.headers.get("x-screen-height")) || 0;
+        const blob = await r.blob(); const u = URL.createObjectURL(blob); img.onload = () => { if (url) URL.revokeObjectURL(url); url = u; }; img.src = u; img.hidden = false; msg.hidden = true;
+      } catch (e) { if (img.hidden) { msg.hidden = false; msg.textContent = /not started|desktop|screenshot|input/i.test(e.message) ? "The desktop is not started yet. Press Start desktop (or the AI will start it)." : e.message; } }
+      busy = false;
+    }
+    timer = setInterval(frame, 1500); frame();
+    if (opts.control) {
+      const send = (body) => api("/desktop/input", { method: "POST", body }).then(() => setTimeout(frame, 400)).catch((e) => { msg.hidden = false; msg.textContent = e.message; });
+      img.onclick = (ev) => { if (!w || !h) return; const r = img.getBoundingClientRect(); send({ type: "click", x: Math.round(((ev.clientX - r.left) / r.width) * w), y: Math.round(((ev.clientY - r.top) / r.height) * h) }); };
+      const ti = root.querySelector(".scr-type");
+      root.querySelector(".scr-send").onclick = () => { if (ti.value) { send({ type: "type", text: ti.value }); ti.value = ""; } };
+      ti.onkeydown = (ev) => { if (ev.key === "Enter") { ev.preventDefault(); root.querySelector(".scr-send").click(); } };
+      root.querySelectorAll("button[data-k]").forEach((b) => (b.onclick = () => send({ type: "key", keys: [b.dataset.k] })));
+      root.querySelector(".scr-start").onclick = async (ev) => { const b = ev.target; b.disabled = true; b.textContent = "Starting..."; try { await api("/desktop/start", { method: "POST", body: {} }); } catch (e) { msg.hidden = false; msg.textContent = e.message; } b.disabled = false; b.textContent = "Start desktop"; frame(); };
+    }
+    return () => { stop = true; clearInterval(timer); if (url) URL.revokeObjectURL(url); };
+  }
+  let stopScreen = null;
 
   async function drawVm() {
     const box = $("#vmbox"); let s; try { s = await api("/vm"); } catch (e) { box.innerHTML = `<span class="err">${esc(e.message)}</span>`; return; }
@@ -47,14 +80,15 @@
 
   /* Floating "Live VM window": stays on top on every tab, shows the same stream, closes with the X. */
   let wes = null;
-  function closeWindow() { if (wes) { wes.close(); wes = null; } const w = document.getElementById("vmlivewin"); if (w) w.remove(); }
+  let unmountWin = null;
+  function closeWindow() { if (wes) { wes.close(); wes = null; } if (unmountWin) { unmountWin(); unmountWin = null; } const w = document.getElementById("vmlivewin"); if (w) w.remove(); }
   window.closeVmWindow = closeWindow;
   function openWindow() {
     if (document.getElementById("vmlivewin")) return;
     const w = document.createElement("div"); w.id = "vmlivewin"; w.className = "vmwin"; w.setAttribute("role", "dialog"); w.setAttribute("aria-label", "Live VM window");
-    w.innerHTML = `<div class="vmwin-h"><span class="dot on"></span><b>Live VM</b><span class="grow"></span><button type="button" id="vmwin-min" aria-label="Minimise">_</button><button type="button" id="vmwin-x" aria-label="Close">&times;</button></div><div class="vmwin-b"><div id="vmwin-live" class="live" role="log" aria-live="polite"><span class="muted">Waiting for the AI to act...</span></div></div>`;
+    w.innerHTML = `<div class="vmwin-h"><span class="dot on"></span><b>Live VM</b><span class="grow"></span><button type="button" id="vmwin-min" aria-label="Minimise">_</button><button type="button" id="vmwin-x" aria-label="Close">&times;</button></div><div class="vmwin-b"><div id="vmwin-screen"></div><details class="vmwin-log"><summary class="muted">Activity</summary><div id="vmwin-live" class="live" role="log" aria-live="polite"><span class="muted">Waiting for the AI to act...</span></div></details></div>`;
     document.body.appendChild(w);
-    const box = w.querySelector("#vmwin-live"); let empty = true;
+    const box = w.querySelector("#vmwin-live"); let empty = true; unmountWin = mountScreen(w.querySelector("#vmwin-screen"), { control: false });
     w.querySelector("#vmwin-x").onclick = closeWindow;
     w.querySelector("#vmwin-min").onclick = () => w.classList.toggle("min");
     wes = new EventSource("/api/activity/stream");

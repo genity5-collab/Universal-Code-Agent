@@ -53,3 +53,9 @@ nav button{min-width:0}nav button span{max-width:100%;overflow:hidden;text-overf
 .vmwin-b{padding:8px;overflow:hidden;display:flex;min-height:0}.vmwin-b .live{max-height:none;height:min(38vh,320px);width:100%}
 .vmwin.min .vmwin-b{display:none}
 .secondary{background:#1a2333;color:inherit;border:1px solid #2a3750}
+
+.scr{position:relative;background:#000;border:1px solid #2a3750;border-radius:10px;overflow:hidden;min-height:160px;display:flex;align-items:center;justify-content:center}
+.scr-img{display:block;width:100%;height:auto;max-height:68vh;object-fit:contain;cursor:crosshair}
+.scr-msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:14px}.scr-msg[hidden]{display:none}
+.scr-ctl{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.scr-ctl .scr-type{flex:1;min-width:140px}
+.vmwin-b{flex-direction:column;overflow:auto}.vmwin-b .scr{min-height:120px}.vmwin-log{margin-top:6px}.vmwin-log .live{height:120px!important}

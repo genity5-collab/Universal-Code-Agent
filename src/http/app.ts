@@ -8,6 +8,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import type { Config } from "../util/config.js";
 import type { AuthStore } from "../auth/store.js";
 import { InstaBoxManager, INSTABOX_SPEC } from "../instabox/client.js";
+import { Desktop } from "../instabox/desktop.js";
 import { ActivityFeed } from "../instabox/activity.js";
 import { vmPath, WORKSPACE_DIR, MAX_WORKSPACE_BYTES } from "../instabox/tools.js";
 import { shq } from "../instabox/client.js";
@@ -59,7 +60,8 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
   const broker = new CodespaceBroker();
   const pvault = new ProviderVault();
   const vm = new InstaBoxManager(pvault, opts.fetchImpl ?? fetch, opts.instaboxBaseUrl, { pollMs: (opts as any).instaboxPollMs });
-  const deps: ToolDeps = { vm, feed, vault: pvault, broker, publicBaseUrl: config.baseUrl, config, approvals, audit, limiter, githubBaseUrl: opts.githubApiBase, fetchImpl: opts.fetchImpl };
+  const desktop = new Desktop(vm, feed);
+  const deps: ToolDeps = { vm, feed, desktop, vault: pvault, broker, publicBaseUrl: config.baseUrl, config, approvals, audit, limiter, githubBaseUrl: opts.githubApiBase, fetchImpl: opts.fetchImpl };
   const secure = config.baseUrl.startsWith("https://");
   const fetchImpl = opts.fetchImpl ?? fetch;
   const webDir = opts.webDir ?? WEB_DIR;
@@ -376,6 +378,18 @@ echo "UCA agent started. Log: $DIR/agent.log"
       }
       // ---- provider keys: the USER pastes a key here (never in chat). Memory only. The AI never sees it. ----
       // ---- VM + Workspace (everything the AI does happens in the user's VM) ----
+      // ---- the VM's real desktop, for the Workspace screen ----
+      if (route === "/desktop/screen" && m === "GET") {
+        try { const st = vm.status(ctx.userId); if (!st.running) return send(res, 409, { error: "No VM is running." }); const s = await desktop.screenshot(ctx.userId); res.writeHead(200, { "content-type": "image/png", "cache-control": "no-store", "x-screen-width": String(s.width ?? ""), "x-screen-height": String(s.height ?? "") }); return void res.end(s.png); }
+        catch (e: any) { return send(res, /VM|key/.test(String(e?.message)) ? 409 : 502, { error: String(e?.message ?? e).slice(0, 300) }); }
+      }
+      if (route === "/desktop/start" && m === "POST") { try { const s = await desktop.start(ctx.userId); return send(res, 200, s); } catch (e: any) { return send(res, /VM|key/.test(String(e?.message)) ? 409 : 502, { error: String(e?.message ?? e).slice(0, 300) }); } }
+      if (route === "/desktop/input" && m === "POST") {
+        try { const b: any = JSON.parse((await readBody(req, 20_000)) || "{}"); const uid = ctx.userId; vm.require(uid);
+          if (b.type === "click") await desktop.click(uid, b.x, b.y, b.button ?? "left", !!b.double); else if (b.type === "type") await desktop.type(uid, String(b.text ?? "")); else if (b.type === "key") await desktop.press(uid, [].concat(b.keys ?? []).map(String)); else if (b.type === "scroll") await desktop.scroll(uid, String(b.direction), b.amount ?? 3); else return send(res, 400, { error: "Unknown input type." });
+          feed.add(uid, { tool: "desktop_" + b.type, kind: "other", summary: `You: ${b.type}${b.type === "click" ? ` at ${b.x},${b.y}` : ""}`, ok: true }); return send(res, 200, { ok: true });
+        } catch (e: any) { return send(res, 400, { error: String(e?.message ?? e).slice(0, 300) }); }
+      }
       if (route === "/vm" && m === "GET") { const st = vm.status(ctx.userId); return send(res, 200, { ...st, workspace: WORKSPACE_DIR, limitBytes: MAX_WORKSPACE_BYTES }); }
       if (route === "/vm/start" && m === "POST") { try { const r = await vm.start(ctx.userId); feed.add(ctx.userId, { tool: "vm_start", kind: "vm", summary: "VM started", ok: true }); return send(res, 200, { ok: true, ...vm.status(ctx.userId), machineId: r.machineId }); } catch (e: any) { return send(res, 400, { error: pvault.scrubAll(ctx.userId, String(e?.message ?? e)) }); } }
       if (route === "/vm/stop" && m === "POST") { const r = await vm.stop(ctx.userId); feed.add(ctx.userId, { tool: "vm_stop", kind: "vm", summary: "VM stopped", ok: true }); return send(res, 200, { stopped: r }); }

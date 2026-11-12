@@ -21,6 +21,7 @@ export interface ToolDeps {
   broker?: import("../codespace/broker.js").CodespaceBroker;
   vm?: import("../instabox/client.js").InstaBoxManager;
   feed?: import("../instabox/activity.js").ActivityFeed;
+  desktop?: import("../instabox/desktop.js").Desktop;
   vault?: import("../providers/vault.js").ProviderVault;
   publicBaseUrl?: string;
   config: Config;
@@ -291,9 +292,11 @@ export async function runTool(def: ToolDef, args: unknown, ctx: UserContext, dep
     } else out = await def.handler(parsed.data, ctx, deps);
     deps.audit.write({ userId: ctx.userId, tool: def.name, ok: true });
     if (out && typeof out === "object" && "__structured" in (out as any)) {
-      const o = out as { __structured: unknown; text?: string };
+      const o = out as { __structured: unknown; text?: string; __image?: string };
       const clean = (v: unknown) => JSON.parse(deps.vault ? deps.vault.scrubAll(ctx.userId, redact(JSON.stringify(v ?? null))) : redact(JSON.stringify(v ?? null)));
-      return { content: [{ type: "text", text: String(o.text ?? "ok") }], structuredContent: clean(o.__structured) } as any;
+      const content: any[] = [{ type: "text", text: String(o.text ?? "ok") }];
+      if (typeof o.__image === "string") content.push({ type: "image", data: o.__image, mimeType: "image/png" });
+      return { content, structuredContent: clean(o.__structured) } as any;
     }
     return ok(JSON.parse(deps.vault ? deps.vault.scrubAll(ctx.userId, redact(JSON.stringify(out ?? null))) : redact(JSON.stringify(out ?? null))));
   } catch (e: any) {

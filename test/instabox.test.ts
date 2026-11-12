@@ -312,3 +312,78 @@ test("find_symbol keeps the original result shape: an array of {name, kind, line
     assert.equal(JSON.parse(text(await u.call("find_symbol", { name: "a; " + ["r","m"].join("") + " -" + "rf /" }))).length, 0, "hostile name is neutralised");
   } finally { await b.stop(); }
 });
+
+// ---------------- the VM's real desktop screen ----------------
+import { fakeXTools } from "./helpers/fakebox.js";
+async function withDesktop() {
+  const b = await boot(); const x = fakeXTools(b.tmp); b.vmf.useX(x.bin);
+  const u = await asUser(b); u.deps.vault.put("guest:tester", { id: "instabox", label: "I", hosts: ["api.instabox.sh"], auth: { type: "header", name: "X-API-Key" } }, KEY); await u.call("vm_start", {});
+  return { b, x, u };
+}
+
+test("DESKTOP: start installs when needed, the AI sees the screen as a real PNG image, and mouse/keyboard reach the VM exactly", async () => {
+  const { b, x, u } = await withDesktop(); try {
+    const st = await u.call("desktop_start", {}); assert.ok(!st.isError, text(st)); assert.match(text(st), /"running": true/); assert.match(text(st), /1280/);
+    const shot = await u.call("desktop_screenshot", {}); assert.ok(!shot.isError, text(shot));
+    const img = shot.content.find((c: any) => c.type === "image"); assert.ok(img, "an image block is returned so a vision model can see the screen"); assert.equal(img.mimeType, "image/png");
+    const png = Buffer.from(img.data, "base64"); assert.equal(png.readUInt32BE(0), 0x89504e47, "really a PNG"); assert.equal(shot.structuredContent.width, 4);
+    await u.call("desktop_click", { x: 100, y: 200 }); await u.call("desktop_click", { x: 5, y: 6, button: "right", double: true });
+    await u.call("desktop_type", { text: `it's "quoted"; $(whoami) \`id\`\nline2 ✓` }); await u.call("desktop_press", { keys: ["ctrl", "l"] }); await u.call("desktop_press", { keys: ["Enter"] });
+    await u.call("desktop_scroll", { direction: "down", amount: 4 }); await u.call("desktop_drag", { x1: 1, y1: 2, x2: 30, y2: 40 }); await u.call("desktop_move", { x: 9, y: 8 });
+    const log = x.readLog();
+    for (const want of ["mousemove 100 200 click 1", "mousemove 5 6 click --repeat 2 --delay 80 3", "key -- ctrl+l", "key -- Return", "click --repeat 4 --delay 30 5", "mousemove 1 2 mousedown 1 sleep 0.1 mousemove 30 40 sleep 0.1 mouseup 1", "mousemove 9 8"]) assert.ok(log.includes(want), `missing: ${want}\n${log}`);
+    assert.ok(log.includes(`type:it's "quoted"; $(whoami) \`id\`\nline2 ✓`), "text is typed literally, nothing is executed:\n" + log);
+    assert.ok(!fs.existsSync(path.join(b.tmp, "PWNED")));
+    assert.ok(u.deps.feed.list("guest:tester").some((a: any) => a.tool === "desktop_click"), "shows in the activity feed");
+  } finally { await b.stop(); }
+});
+
+test("DESKTOP: nothing works without a VM, hostile or out-of-range input is refused before it reaches a shell, and no screenshot files are left behind", async () => {
+  const b = await boot(); const x = fakeXTools(b.tmp); b.vmf.useX(x.bin); try {
+    const u = await asUser(b);
+    for (const [n, a] of [["desktop_screenshot", {}], ["desktop_click", { x: 1, y: 1 }], ["desktop_type", { text: "hi" }], ["desktop_press", { keys: ["a"] }], ["desktop_open", { url: "https://example.com" }], ["desktop_start", {}]] as any) { const r = await u.call(n, a); assert.equal(r.isError, true, n); assert.match(text(r), /VM|key/i, n); }
+    u.deps.vault.put("guest:tester", { id: "instabox", label: "I", hosts: ["api.instabox.sh"], auth: { type: "header", name: "X-API-Key" } }, KEY); await u.call("vm_start", {}); await u.call("desktop_start", {});
+    for (const [n, a] of [["desktop_click", { x: -1, y: 5 }], ["desktop_click", { x: "1; touch /tmp/PWNED", y: 2 }], ["desktop_click", { x: 1.5, y: 2 }], ["desktop_scroll", { direction: "sideways" }], ["desktop_press", { keys: ["ctrl; rm x"] }], ["desktop_press", { keys: [] }], ["desktop_open", { url: "file:///etc/passwd" }], ["desktop_open", { url: "javascript:alert(1)" }], ["desktop_type", { text: "" }]] as any) { const r = await u.call(n, a); assert.equal(r.isError, true, n + JSON.stringify(a)); }
+    assert.equal(x.readLog(), "", "nothing invalid ever reached xdotool");
+    await u.call("desktop_screenshot", {});
+    const left = execFileSync("bash", ["-c", `ls ${b.vmf.root}/*/ 2>/dev/null; find ${b.vmf.root} -name 'uca-shot-*' | wc -l`], { encoding: "utf8" }); assert.match(left.trim().split("\n").pop()!, /^0$/, "temporary screenshots are deleted");
+  } finally { await b.stop(); }
+});
+
+test("DESKTOP: a VM without screenshot tools says exactly how to fix it instead of failing mysteriously", async () => {
+  const b = await boot(); try {
+    const u = await asUser(b); u.deps.vault.put("guest:tester", { id: "instabox", label: "I", hosts: ["api.instabox.sh"], auth: { type: "header", name: "X-API-Key" } }, KEY); await u.call("vm_start", {});
+    const r = await u.call("desktop_screenshot", {}); assert.equal(r.isError, true); assert.match(text(r), /apt-get install[^\n]*scrot|desktop_start|screenshot tool/i);
+  } finally { await b.stop(); }
+});
+
+test("DESKTOP over HTTP: the website gets the screen as a PNG, can click/type/press through the protected input route, and a stranger cannot", async () => {
+  const b = await boot(); const x = fakeXTools(b.tmp); b.vmf.useX(x.bin); try {
+    const g = await guestSession(b.base);
+    assert.equal((await fetch(`${b.base}/api/desktop/screen`)).status, 401, "needs login");
+    assert.equal((await fetch(`${b.base}/api/desktop/input`, { method: "POST", body: "{}" })).status, 401);
+    assert.equal((await fetch(`${b.base}/api/desktop/screen`, { headers: { cookie: g.cookie } })).status, 409, "no VM yet: a clear refusal, not a crash");
+    await fetch(`${b.base}/api/providers`, { method: "POST", headers: g.H, body: JSON.stringify({ id: "instabox", key: KEY }) }); assert.equal((await fetch(`${b.base}/api/vm/start`, { method: "POST", headers: g.H, body: "{}" })).status, 200);
+    assert.equal((await fetch(`${b.base}/api/desktop/start`, { method: "POST", headers: g.H, body: "{}" })).status, 200);
+    const s = await fetch(`${b.base}/api/desktop/screen`, { headers: { cookie: g.cookie } }); assert.equal(s.status, 200); assert.equal(s.headers.get("content-type"), "image/png"); assert.equal(s.headers.get("cache-control"), "no-store");
+    const buf = Buffer.from(await s.arrayBuffer()); assert.equal(buf.readUInt32BE(0), 0x89504e47); assert.equal(s.headers.get("x-screen-width"), "4");
+    const inp = (body: any, headers = g.H) => fetch(`${b.base}/api/desktop/input`, { method: "POST", headers, body: JSON.stringify(body) });
+    assert.equal((await inp({ type: "click", x: 10, y: 20 })).status, 200); assert.equal((await inp({ type: "type", text: "hello" })).status, 200); assert.equal((await inp({ type: "key", keys: ["Return"] })).status, 200);
+    assert.equal((await inp({ type: "click", x: "1;x", y: 2 })).status, 400); assert.equal((await inp({ type: "nope" })).status, 400);
+    assert.equal((await inp({ type: "click", x: 1, y: 1 }, { cookie: g.cookie, "content-type": "application/json" })).status >= 400, true, "a request without the CSRF token is refused");
+    const log = x.readLog(); assert.ok(log.includes("mousemove 10 20 click 1") && log.includes("type:hello") && log.includes("key -- Return"), log);
+  } finally { await b.stop(); }
+});
+
+test("DESKTOP privacy: user B can neither see nor drive user A's screen, and the window tools only report on the caller's own VM", async () => {
+  const { b, x, u } = await withDesktop(); try {
+    await u.call("desktop_start", {});
+    const other = await asUser(b, "guest:other");
+    for (const [n, a] of [["desktop_screenshot", {}], ["desktop_click", { x: 1, y: 1 }], ["desktop_type", { text: "stolen" }], ["vm_screen_poll", {}], ["vm_live", {}]] as any) {
+      const r = await other.call(n, a);
+      if (n === "vm_screen_poll" || n === "vm_live") { assert.ok(!r.isError); assert.equal(JSON.stringify(r.structuredContent).includes("data:image"), false, n + " leaked a picture"); assert.deepEqual(r.structuredContent.items ?? [], [], n); }
+      else assert.equal(r.isError, true, n);
+    }
+    assert.ok(!x.readLog().includes("stolen") && !x.readLog().includes("mousemove 1 1"), "B never reached A's desktop");
+  } finally { await b.stop(); }
+});

@@ -53,6 +53,17 @@ Base URL `https://api.instabox.sh`, key in the `X-API-Key` header (the server ad
 `DELETE /v1/machines/{id}` needs `Idempotency-Key` and `X-Confirm-Delete: <id>`. Full spec: https://api.instabox.sh/v1/openapi.json, docs index: https://instabox.sh/docs/llms.txt.
 Use the provider tools (`provider_search_docs`, `provider_read_doc`) to read these pages; do not guess endpoints.
 
+## The VM screen (a real Linux desktop)
+
+Some VMs have a graphical Linux desktop (InstaBox `agent-browser` does). Use it for anything visual: browsers, GUI apps, checking how a web page looks.
+
+1. `desktop_start` once (it installs the desktop first if the VM lacks it, about 30 seconds).
+2. `desktop_screenshot` returns the screen as an image. Look at it before acting. Coordinates are pixels from the top left of that image.
+3. Act with `desktop_click`, `desktop_type` (click the field first), `desktop_press` (e.g. ["ctrl","l"], ["Enter"]), `desktop_scroll`, `desktop_drag`, `desktop_move`, `desktop_open` (http/https only).
+4. Take another screenshot after every action to check the result. Do not guess.
+
+`vm_live` opens a live window in the chat that shows this screen, so the user can watch. The user can also watch and click on it in the app's Workspace tab. If a screenshot fails with "no screenshot tool", run `sudo apt-get update && sudo apt-get install -y scrot xdotool`.
+
 ## Errors you may see
 
 - `No InstaBox key` / `No VM is attached` -> see "Before you do anything".
