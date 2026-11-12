@@ -335,3 +335,12 @@ test("defense in depth: an error raised OUTSIDE the vault that contains the key 
   assert.ok(!fs.readFileSync(path.join(tmp, "audit.log"), "utf8").includes(KEY), "audit.log leaked key");
   fs.rmSync(tmp, { recursive: true, force: true });
 });
+
+test("static assets are served with correct content types (PNG icons must be image/png so the app is installable)", async () => {
+  const c = await boot();
+  try {
+    for (const [p, re] of [["/icons/icon-192.png", /^image\/png/], ["/icons/icon-512.png", /^image\/png/], ["/icons/maskable-512.png", /^image\/png/], ["/icons/apple-touch-icon.png", /^image\/png/], ["/manifest.webmanifest", /manifest\+json/], ["/sw.js", /javascript/]] as const) {
+      const r = await fetch(c.base + p); assert.equal(r.status, 200, p); assert.match(r.headers.get("content-type") ?? "", re, p);
+    }
+  } finally { await c.stop(); }
+});
