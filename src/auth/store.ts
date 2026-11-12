@@ -236,6 +236,8 @@ export interface AuthStoreOptions {
   now?: () => number;
   /** Override the database path (tests). Defaults to `<dataDir>/auth-store.json`. */
   filePath?: string;
+  /** Called after every successful write (used by the remote mirror). */
+  onPersist?: () => void;
 }
 
 /**
@@ -250,9 +252,11 @@ export class AuthStore {
   private db: AuthDb;
   private key: Buffer | null = null;
   private readonly clock: () => number;
+  private onPersist: (() => void) | undefined;
 
   constructor(config: Config, opts: AuthStoreOptions = {}) {
     this.config = config;
+    this.onPersist = opts.onPersist;
     this.clock = opts.now ?? (() => Date.now());
     ensureDirSync(config.dataDir);
     this.filePath = opts.filePath ?? path.join(config.dataDir, DB_FILE);
@@ -357,7 +361,14 @@ export class AuthStore {
   private persist(): void {
     this.prune();
     atomicWriteFileSync(this.filePath, JSON.stringify(this.db, null, 2), 0o600);
+    try { this.onPersist?.(); } catch { /* a mirror problem must never break a write */ }
   }
+
+  /** Register or replace the after-write hook (the mirror attaches here). */
+  setOnPersist(fn: (() => void) | undefined): void { this.onPersist = fn; }
+
+  /** Current database file contents, or null if unreadable. */
+  readRaw(): string | null { try { return fs.readFileSync(this.filePath, "utf8"); } catch { return null; } }
 
   /** Drop entries well past their expiry; keeps recent ones for replay detection. */
   prune(): void {

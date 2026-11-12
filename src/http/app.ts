@@ -1,3 +1,4 @@
+import { AuthMirror } from "../auth/mirror.js";
 import http from "node:http";
 import nodeCrypto from "node:crypto";
 import fs from "node:fs";
@@ -26,8 +27,8 @@ import type { UserContext } from "../types.js";
 const WEB_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../web");
 const MIME: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".webmanifest": "application/manifest+json", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon", ".json": "application/json; charset=utf-8", ".txt": "text/plain; charset=utf-8", ".woff2": "font/woff2" };
 
-export interface AppOptions { githubApiBase?: string; githubWebBase?: string; fetchImpl?: typeof fetch; webDir?: string }
-export interface App { store: AuthStore; pvault: ProviderVault; broker: CodespaceBroker; server: http.Server; auth: AuthorizationServer; sessions: SessionManager; approvals: ApprovalService; deps: ToolDeps; close(): Promise<void> }
+export interface AppOptions { githubApiBase?: string; githubWebBase?: string; fetchImpl?: typeof fetch; webDir?: string; mirror?: AuthMirror | null }
+export interface App { mirror: AuthMirror | null; store: AuthStore; pvault: ProviderVault; broker: CodespaceBroker; server: http.Server; auth: AuthorizationServer; sessions: SessionManager; approvals: ApprovalService; deps: ToolDeps; close(): Promise<void> }
 
 function readBody(req: http.IncomingMessage, limit = 2_000_000): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -43,6 +44,8 @@ function escHtml(s: string): string { return s.replace(/[&<>"']/g, (c) => ({ "&"
 export function createApp(config: Config, opts: AppOptions = {}): App {
   const auth = new AuthorizationServer(config);
   const store = auth.store;
+  const mirror = opts.mirror ?? null;
+  if (mirror) { mirror.attach(() => store.readRaw()); store.setOnPersist(() => mirror.markDirty()); mirror.markDirty(); }
   const sessions = new SessionManager(store);
   const vault = new GithubTokenVault(store);
   const approvals = new ApprovalService();
@@ -123,7 +126,7 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
       return send(res, 200, {
         baseUrl: config.baseUrl, mcpUrl: `${config.baseUrl}/mcp`, callbackUrl: `${config.baseUrl}/auth/github/callback`,
         githubConfigured: !!(config.githubClientId && config.githubClientSecret), guestMode: config.allowGuests, https: config.baseUrl.startsWith("https://"), needsHttps,
-        persistent: process.env.UCA_PERSISTENT === "true",
+        persistent: process.env.UCA_PERSISTENT === "true" || !!mirror, mirror: mirror ? { enabled: true, lastError: mirror.lastError, blocked: mirror.status().blocked } : { enabled: false },
         newOAuthAppUrl: "https://github.com/settings/applications/new",
       });
     }
@@ -397,5 +400,5 @@ echo "UCA agent started. Log: $DIR/agent.log"
   }
 
   const server = http.createServer((req, res) => { handle(req, res).catch((e: any) => { if (!res.headersSent) send(res, e?.status ?? 500, { error: redact(String(e?.message ?? "internal_error")) }); else res.end(); }); });
-  return { store, pvault, broker, server, auth, sessions, approvals, deps, close: () => new Promise<void>((r) => { const t = setTimeout(r, 3000); t.unref?.(); server.close(() => { clearTimeout(t); r(); }); (server as any).closeIdleConnections?.(); setTimeout(() => (server as any).closeAllConnections?.(), 1000).unref?.(); }) };
+  return { mirror, store, pvault, broker, server, auth, sessions, approvals, deps, close: () => new Promise<void>((r) => { void mirror?.flush(); const t = setTimeout(r, 3000); t.unref?.(); server.close(() => { clearTimeout(t); r(); }); (server as any).closeIdleConnections?.(); setTimeout(() => (server as any).closeAllConnections?.(), 1000).unref?.(); }) };
 }

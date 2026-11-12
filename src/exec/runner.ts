@@ -712,6 +712,9 @@ export async function shutdownAllAsync(graceMs = 2000): Promise<number> {
 }
 
 let shutdownInstalled = false;
+const shutdownHooks: Array<() => Promise<unknown>> = [];
+/** Register async work (e.g. flushing the state mirror) that must finish, within a time limit, before the process exits on SIGINT/SIGTERM. */
+export function onGracefulShutdown(fn: () => Promise<unknown>): void { shutdownHooks.push(fn); }
 /** Install process-level cleanup once (opt out with UCA_NO_SIGNAL_HANDLERS=1). */
 export function installShutdownHandlers(): void {
   if (shutdownInstalled) return;
@@ -723,7 +726,10 @@ export function installShutdownHandlers(): void {
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
     process.once(sig, () => {
       shutdownAll();
-      process.exit(sig === "SIGINT" ? 130 : 143);
+      const code = sig === "SIGINT" ? 130 : 143;
+      if (shutdownHooks.length === 0) return void process.exit(code);
+      const limit = new Promise((r) => { const t = setTimeout(r, 4000); t.unref?.(); });
+      void Promise.race([Promise.allSettled(shutdownHooks.map((h) => h())), limit]).finally(() => process.exit(code));
     });
   }
 }
