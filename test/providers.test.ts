@@ -508,3 +508,33 @@ test("CORS: public protocol endpoints answer browser preflights; the cookie-auth
     const g = await fetch(`${c.base}/auth/guest`, { method: "OPTIONS", headers: { origin: "https://evil.example" } }); assert.equal(g.headers.get("access-control-allow-origin"), null, "guest login must not be cross-origin callable");
   } finally { await c.stop(); }
 });
+
+test("chooser: when BOTH GitHub and guest are enabled, /authorize offers a choice; a guest is only minted by an explicit POST; GET never creates one", async () => {
+  const c = await bootGuest({ GITHUB_CLIENT_ID: "cid", GITHUB_CLIENT_SECRET: "sec", UCA_ALLOW_GUESTS: "true" });
+  try {
+    const ru = "https://chatgpt.com/connector_platform_oauth_redirect";
+    const reg = await (await fetch(`${c.base}/oauth/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "ChatGPT", redirect_uris: [ru], token_endpoint_auth_method: "none" }) })).json() as any;
+    const { verifier, challenge } = pkce();
+    const q = new URLSearchParams({ response_type: "code", client_id: reg.client_id, redirect_uri: ru, code_challenge: challenge, code_challenge_method: "S256", scope: "mcp:read mcp:write mcp:exec", state: "s", resource: `${c.base}/mcp` });
+    const a = await fetch(`${c.base}/oauth/authorize?${q}`, { redirect: "manual" }); assert.equal(a.status, 302);
+    const loc = new URL(a.headers.get("location")!, c.base); assert.equal(loc.pathname, "/authorize/choose", "must offer a choice, not force GitHub: " + loc.pathname);
+    const before = c.app.store.countUsers("guest:");
+    const page = await (await fetch(loc)).text(); assert.match(page, /Continue as guest/); assert.match(page, /Sign in with GitHub/);
+    await fetch(loc); await fetch(`${c.base}/authorize/guest?pending=x`); assert.equal(c.app.store.countUsers("guest:"), before, "viewing/previewing links must not create guests");
+    const pending = loc.searchParams.get("pending")!;
+    // the GitHub option really goes to github.com
+    const gh = await fetch(`${c.base}/authorize/github?pending=${pending}`, { redirect: "manual" }); assert.equal(gh.status, 302); assert.match(gh.headers.get("location")!, /\/login\/oauth\/authorize\?client_id=cid/);
+    // the guest option works end to end through to a token
+    const gp = await fetch(`${c.base}/authorize/guest`, { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ pending }) }); assert.equal(gp.status, 302);
+    const cookie = gp.headers.getSetCookie().map((x) => x.split(";")[0]).join("; "); assert.equal(c.app.store.countUsers("guest:"), before + 1);
+    const cp = await (await fetch(new URL(gp.headers.get("location")!, c.base), { headers: { cookie } })).text();
+    const csrf = /name=csrf value="([^"]+)"/.exec(cp)![1];
+    const dec = await fetch(`${c.base}/authorize/decision`, { method: "POST", redirect: "manual", headers: { cookie, "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ pending, csrf, decision: "approve" }) });
+    const code = new URL(dec.headers.get("location")!).searchParams.get("code")!; assert.ok(code);
+    const tok = await (await fetch(`${c.base}/oauth/token`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: ru, client_id: reg.client_id, code_verifier: verifier, resource: `${c.base}/mcp` }) })).json() as any; assert.ok(tok.access_token);
+    const mc = await mcpClient({ base: c.base } as any, tok.access_token); assert.ok((await mc.listTools()).tools.length > 40); await mc.close();
+    // with guests disabled the chooser refuses
+    const off = await bootGuest({ GITHUB_CLIENT_ID: "cid", GITHUB_CLIENT_SECRET: "sec", UCA_ALLOW_GUESTS: "false" });
+    try { assert.equal((await fetch(`${off.base}/authorize/choose?pending=${pending}`)).status, 400); assert.equal((await fetch(`${off.base}/authorize/guest`, { method: "POST", body: new URLSearchParams({ pending }) })).status, 400); } finally { await off.stop(); }
+  } finally { await c.stop(); }
+});

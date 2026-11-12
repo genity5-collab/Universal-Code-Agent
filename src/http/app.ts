@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Config } from "../util/config.js";
+import type { AuthStore } from "../auth/store.js";
 import { AuthorizationServer } from "../auth/oauth.js";
 import { SessionManager, parseCookies } from "../auth/session.js";
 import { GithubTokenVault } from "../auth/tokenvault.js";
@@ -26,7 +27,7 @@ const WEB_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.
 const MIME: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".webmanifest": "application/manifest+json", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon", ".json": "application/json; charset=utf-8", ".txt": "text/plain; charset=utf-8", ".woff2": "font/woff2" };
 
 export interface AppOptions { githubApiBase?: string; githubWebBase?: string; fetchImpl?: typeof fetch; webDir?: string }
-export interface App { pvault: ProviderVault; broker: CodespaceBroker; server: http.Server; auth: AuthorizationServer; sessions: SessionManager; approvals: ApprovalService; deps: ToolDeps; close(): Promise<void> }
+export interface App { store: AuthStore; pvault: ProviderVault; broker: CodespaceBroker; server: http.Server; auth: AuthorizationServer; sessions: SessionManager; approvals: ApprovalService; deps: ToolDeps; close(): Promise<void> }
 
 function readBody(req: http.IncomingMessage, limit = 2_000_000): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -145,12 +146,35 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
         const g = guestLogin(req); if ("error" in g) return send(res, g.status, `<h1>${escHtml(g.error)}</h1>`);
         return redirect(res, `/authorize/consent?pending=${encodeURIComponent(r.pending.id)}`, { "set-cookie": g.cookie });
       }
+      if (!sess && config.allowGuests && config.githubClientId) {
+        // Both are available: let the person choose. A guest is only created by an explicit POST (never by a link preview).
+        return redirect(res, `/authorize/choose?pending=${encodeURIComponent(r.pending.id)}`);
+      }
       if (!sess) {
         const tmp = sessions.createSession("anon:" + r.pending.id); // pre-login session binds the GitHub state
         const st = sessions.createOAuthState(tmp.session.id, { redirectTo: `/authorize/consent?pending=${encodeURIComponent(r.pending.id)}` });
         return redirect(res, authUrl(st.state), { "set-cookie": tmp.cookie });
       }
       return redirect(res, `/authorize/consent?pending=${encodeURIComponent(r.pending.id)}`);
+    }
+    if (p === "/authorize/choose" && m === "GET") {
+      const pid = url.searchParams.get("pending") ?? ""; const pend = store.getPending(pid);
+      if (!pend || pend.expiresAt < Date.now() || !config.allowGuests) return send(res, 400, "<h1>Authorization request expired. Start again from your AI client.</h1>");
+      const html = `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Connect</title><style>body{font:16px system-ui;background:#0b0f17;color:#e6edf6;max-width:520px;margin:0 auto;padding:20px}.c{background:#131a26;border:1px solid #243047;border-radius:14px;padding:16px;margin-top:14px}button,a.b{display:block;width:100%;box-sizing:border-box;text-align:center;text-decoration:none;padding:14px;border-radius:10px;border:0;font-size:16px;margin-top:10px;background:#3b82f6;color:#fff}.s{background:#243047}p{color:#9fb0c8}</style><h2>Connect your AI</h2><div class=c><b>Continue as guest</b><p>Fastest. No account, no keys. You get a private workspace for files and commands. GitHub features stay off.</p><form method=post action="/authorize/guest"><input type=hidden name=pending value="${escHtml(pid)}"><button>Continue as guest</button></form></div><div class=c><b>Sign in with GitHub</b><p>Also lets your AI use your repos and Codespaces.</p><a class="b s" href="/authorize/github?pending=${encodeURIComponent(pid)}">Sign in with GitHub</a></div>`;
+      return send(res, 200, html);
+    }
+    if (p === "/authorize/guest" && m === "POST") {
+      const f = parseForm(await readBody(req, 5_000)); const pid = String(f.pending ?? ""); const pend = store.getPending(pid);
+      if (!pend || pend.expiresAt < Date.now()) return send(res, 400, "<h1>Authorization request expired. Start again from your AI client.</h1>");
+      const g = guestLogin(req); if ("error" in g) return send(res, g.status, `<h1>${escHtml(g.error)}</h1>`);
+      return redirect(res, `/authorize/consent?pending=${encodeURIComponent(pid)}`, { "set-cookie": g.cookie });
+    }
+    if (p === "/authorize/github" && m === "GET") {
+      const pid = url.searchParams.get("pending") ?? ""; const pend = store.getPending(pid);
+      if (!pend || pend.expiresAt < Date.now()) return send(res, 400, "<h1>Authorization request expired. Start again from your AI client.</h1>");
+      const tmp = sessions.createSession("anon:" + pid);
+      const st = sessions.createOAuthState(tmp.session.id, { redirectTo: `/authorize/consent?pending=${encodeURIComponent(pid)}` });
+      return redirect(res, authUrl(st.state), { "set-cookie": tmp.cookie });
     }
     if (p === "/authorize/consent" && m === "GET") {
       const sess = sessions.getSession(parseCookies(req.headers.cookie)); const pid = url.searchParams.get("pending") ?? "";
@@ -366,5 +390,5 @@ echo "UCA agent started. Log: $DIR/agent.log"
   }
 
   const server = http.createServer((req, res) => { handle(req, res).catch((e: any) => { if (!res.headersSent) send(res, e?.status ?? 500, { error: redact(String(e?.message ?? "internal_error")) }); else res.end(); }); });
-  return { pvault, broker, server, auth, sessions, approvals, deps, close: () => new Promise<void>((r) => { const t = setTimeout(r, 3000); t.unref?.(); server.close(() => { clearTimeout(t); r(); }); (server as any).closeIdleConnections?.(); setTimeout(() => (server as any).closeAllConnections?.(), 1000).unref?.(); }) };
+  return { store, pvault, broker, server, auth, sessions, approvals, deps, close: () => new Promise<void>((r) => { const t = setTimeout(r, 3000); t.unref?.(); server.close(() => { clearTimeout(t); r(); }); (server as any).closeIdleConnections?.(); setTimeout(() => (server as any).closeAllConnections?.(), 1000).unref?.(); }) };
 }
