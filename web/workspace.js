@@ -19,31 +19,51 @@
 
   /* The VM's real desktop: a live picture (refreshed about every 1.5 s), click on it to click in the VM, a box to type, quick keys. */
   function mountScreen(root, opts) {
-    opts = opts || {}; let stop = false, busy = false, w = 0, h = 0, url = null, timer = null;
-    root.innerHTML = `<div class="scr"><img class="scr-img" alt="Live screen of your VM" hidden><div class="scr-msg muted">Connecting to the VM screen...</div></div>` +
+    opts = opts || {}; let stop = false, w = 0, h = 0, url = null, mode = "frames", fails = 0;
+    root.innerHTML = `<div class="scr"><img class="scr-img" alt="Live screen of your VM" hidden><iframe class="scr-live" title="Live VM desktop" hidden allow="clipboard-read; clipboard-write" referrerpolicy="no-referrer"></iframe><div class="scr-msg muted">Connecting to the VM screen...</div><span class="scr-badge" hidden></span></div>` +
       (opts.control ? `<div class="scr-ctl"><input class="scr-type" placeholder="Type into the VM, then press Send" aria-label="Text to type"><button type="button" class="scr-send">Send</button><button type="button" data-k="Return">Enter</button><button type="button" data-k="Tab">Tab</button><button type="button" data-k="Escape">Esc</button><button type="button" class="scr-start secondary">Start desktop</button></div>` : "");
-    const img = root.querySelector(".scr-img"), msg = root.querySelector(".scr-msg");
-    async function frame() {
-      if (stop || busy || document.hidden) return; busy = true;
+    const img = root.querySelector(".scr-img"), msg = root.querySelector(".scr-msg"), live = root.querySelector(".scr-live"), badge = root.querySelector(".scr-badge");
+    const say = (t) => { msg.hidden = false; msg.textContent = t; };
+    /* 1) InstaBox's own real-time viewer (true video + mouse + keyboard) when the key is allowed to make one. */
+    async function tryLive() {
       try {
-        const r = await fetch("/api/desktop/screen", { credentials: "same-origin", cache: "no-store" });
-        if (!r.ok) { let e = ""; try { e = (await r.json()).error || ""; } catch {} throw new Error(e || "Screen not available"); }
-        w = Number(r.headers.get("x-screen-width")) || 0; h = Number(r.headers.get("x-screen-height")) || 0;
-        const blob = await r.blob(); const u = URL.createObjectURL(blob); img.onload = () => { if (url) URL.revokeObjectURL(url); url = u; }; img.src = u; img.hidden = false; msg.hidden = true;
-      } catch (e) { if (img.hidden) { msg.hidden = false; msg.textContent = /not started|desktop|screenshot|input/i.test(e.message) ? "The desktop is not started yet. Press Start desktop (or the AI will start it)." : e.message; } }
-      busy = false;
+        const r = await api("/desktop/stream", { method: "POST", body: { control: !!opts.control } });
+        if (r && r.available && /^https:\/\//.test(r.url)) { live.src = r.url; live.hidden = false; img.hidden = true; msg.hidden = true; mode = "live"; badge.hidden = false; badge.textContent = "LIVE"; return true; }
+      } catch (e) { /* fall through to fast frames */ }
+      return false;
     }
-    timer = setInterval(frame, 1500); frame();
+    /* 2) Fast frames: the next frame is requested the moment the last one has arrived, so speed is limited only by the network. */
+    async function loop() {
+      let shown = 0, t0 = Date.now();
+      while (!stop && mode === "frames") {
+        if (document.hidden) { await new Promise((r) => setTimeout(r, 500)); continue; }
+        const t = Date.now();
+        try {
+          const r = await fetch("/api/desktop/frame", { credentials: "same-origin", cache: "no-store" });
+          if (!r.ok) { let e = ""; try { e = (await r.json()).error || ""; } catch (x) {} throw new Error(e || "Screen not available"); }
+          const blob = await r.blob(); const u = URL.createObjectURL(blob); const old = url; url = u;
+          await new Promise((ok) => { img.onload = img.onerror = ok; img.src = u; }); if (old) URL.revokeObjectURL(old);
+          img.hidden = false; msg.hidden = true; fails = 0; shown++;
+          const nat = img.naturalWidth; if (nat) { w = nat; h = img.naturalHeight; }
+          if (Date.now() - t0 > 2000) { badge.hidden = false; badge.textContent = (shown / ((Date.now() - t0) / 1000)).toFixed(1) + " fps"; shown = 0; t0 = Date.now(); }
+          const spent = Date.now() - t; if (spent < 80) await new Promise((r2) => setTimeout(r2, 80 - spent));
+        } catch (e) {
+          fails++; if (img.hidden || fails > 3) say(/not started|desktop|screenshot|input/i.test(e.message) ? "The desktop is not started yet. Press Start desktop (or the AI will start it)." : e.message);
+          await new Promise((r2) => setTimeout(r2, Math.min(4000, 700 * fails)));
+        }
+      }
+    }
+    (async () => { if (!(await tryLive())) loop(); })();
     if (opts.control) {
-      const send = (body) => api("/desktop/input", { method: "POST", body }).then(() => setTimeout(frame, 400)).catch((e) => { msg.hidden = false; msg.textContent = e.message; });
+      const send = (body) => api("/desktop/input", { method: "POST", body }).catch((e) => say(e.message));
       img.onclick = (ev) => { if (!w || !h) return; const r = img.getBoundingClientRect(); send({ type: "click", x: Math.round(((ev.clientX - r.left) / r.width) * w), y: Math.round(((ev.clientY - r.top) / r.height) * h) }); };
       const ti = root.querySelector(".scr-type");
       root.querySelector(".scr-send").onclick = () => { if (ti.value) { send({ type: "type", text: ti.value }); ti.value = ""; } };
       ti.onkeydown = (ev) => { if (ev.key === "Enter") { ev.preventDefault(); root.querySelector(".scr-send").click(); } };
       root.querySelectorAll("button[data-k]").forEach((b) => (b.onclick = () => send({ type: "key", keys: [b.dataset.k] })));
-      root.querySelector(".scr-start").onclick = async (ev) => { const b = ev.target; b.disabled = true; b.textContent = "Starting..."; try { await api("/desktop/start", { method: "POST", body: {} }); } catch (e) { msg.hidden = false; msg.textContent = e.message; } b.disabled = false; b.textContent = "Start desktop"; frame(); };
+      root.querySelector(".scr-start").onclick = async (ev) => { const b = ev.target; b.disabled = true; b.textContent = "Starting..."; try { await api("/desktop/start", { method: "POST", body: {} }); if (mode === "frames") { fails = 0; } else if (!(await tryLive())) { mode = "frames"; live.hidden = true; loop(); } } catch (e) { say(e.message); } b.disabled = false; b.textContent = "Start desktop"; };
     }
-    return () => { stop = true; clearInterval(timer); if (url) URL.revokeObjectURL(url); };
+    return () => { stop = true; if (url) URL.revokeObjectURL(url); live.src = "about:blank"; };
   }
   let stopScreen = null;
 

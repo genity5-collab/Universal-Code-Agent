@@ -85,7 +85,7 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
 
   const secHeaders: Record<string, string> = {
     "x-content-type-options": "nosniff", "referrer-policy": "no-referrer", "x-frame-options": "DENY",
-    "content-security-policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; form-action 'self' https: http:",
+    "content-security-policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; frame-src https://*.instabox.sh https://instabox.sh; connect-src 'self'; frame-ancestors 'none'; form-action 'self' https: http:",
     ...(secure ? { "strict-transport-security": "max-age=31536000; includeSubDomains" } : {}),
   };
   const send = (res: http.ServerResponse, status: number, body: unknown, headers: Record<string, string | string[]> = {}) => {
@@ -379,6 +379,14 @@ echo "UCA agent started. Log: $DIR/agent.log"
       // ---- provider keys: the USER pastes a key here (never in chat). Memory only. The AI never sees it. ----
       // ---- VM + Workspace (everything the AI does happens in the user's VM) ----
       // ---- the VM's real desktop, for the Workspace screen ----
+      if (route === "/desktop/frame" && m === "GET") {
+        try { if (!vm.status(ctx.userId).running) return send(res, 409, { error: "No VM is running." }); const f = await desktop.frame(ctx.userId); res.writeHead(200, { "content-type": f.type === "jpeg" ? "image/jpeg" : "image/png", "cache-control": "no-store", "x-frame-type": f.type }); return void res.end(f.img); }
+        catch (e: any) { return send(res, /VM|key/.test(String(e?.message)) ? 409 : 502, { error: String(e?.message ?? e).slice(0, 300) }); }
+      }
+      if (route === "/desktop/stream" && m === "POST") {
+        try { vm.require(ctx.userId); const b: any = JSON.parse((await readBody(req, 2000)) || "{}"); const r = await desktop.streamUrl(ctx.userId, b.control !== true); return send(res, 200, r ? { available: true, ...r } : { available: false }); }
+        catch (e: any) { return send(res, /VM|key/.test(String(e?.message)) ? 409 : 502, { error: String(e?.message ?? e).slice(0, 300) }); }
+      }
       if (route === "/desktop/screen" && m === "GET") {
         try { const st = vm.status(ctx.userId); if (!st.running) return send(res, 409, { error: "No VM is running." }); const s = await desktop.screenshot(ctx.userId); res.writeHead(200, { "content-type": "image/png", "cache-control": "no-store", "x-screen-width": String(s.width ?? ""), "x-screen-height": String(s.height ?? "") }); return void res.end(s.png); }
         catch (e: any) { return send(res, /VM|key/.test(String(e?.message)) ? 409 : 502, { error: String(e?.message ?? e).slice(0, 300) }); }

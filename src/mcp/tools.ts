@@ -292,10 +292,10 @@ export async function runTool(def: ToolDef, args: unknown, ctx: UserContext, dep
     } else out = await def.handler(parsed.data, ctx, deps);
     deps.audit.write({ userId: ctx.userId, tool: def.name, ok: true });
     if (out && typeof out === "object" && "__structured" in (out as any)) {
-      const o = out as { __structured: unknown; text?: string; __image?: string };
+      const o = out as { __structured: unknown; text?: string; __image?: string; __mime?: string };
       const clean = (v: unknown) => JSON.parse(deps.vault ? deps.vault.scrubAll(ctx.userId, redact(JSON.stringify(v ?? null))) : redact(JSON.stringify(v ?? null)));
       const content: any[] = [{ type: "text", text: String(o.text ?? "ok") }];
-      if (typeof o.__image === "string") content.push({ type: "image", data: o.__image, mimeType: "image/png" });
+      if (typeof o.__image === "string") content.push({ type: "image", data: o.__image, mimeType: o.__mime === "image/jpeg" ? "image/jpeg" : "image/png" });
       return { content, structuredContent: clean(o.__structured) } as any;
     }
     return ok(JSON.parse(deps.vault ? deps.vault.scrubAll(ctx.userId, redact(JSON.stringify(out ?? null))) : redact(JSON.stringify(out ?? null))));

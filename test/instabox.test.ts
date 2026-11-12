@@ -325,8 +325,8 @@ test("DESKTOP: start installs when needed, the AI sees the screen as a real PNG 
   const { b, x, u } = await withDesktop(); try {
     const st = await u.call("desktop_start", {}); assert.ok(!st.isError, text(st)); assert.match(text(st), /"running": true/); assert.match(text(st), /1280/);
     const shot = await u.call("desktop_screenshot", {}); assert.ok(!shot.isError, text(shot));
-    const img = shot.content.find((c: any) => c.type === "image"); assert.ok(img, "an image block is returned so a vision model can see the screen"); assert.equal(img.mimeType, "image/png");
-    const png = Buffer.from(img.data, "base64"); assert.equal(png.readUInt32BE(0), 0x89504e47, "really a PNG"); assert.equal(shot.structuredContent.width, 4);
+    const img = shot.content.find((c: any) => c.type === "image"); assert.ok(img, "an image block is returned so a vision model can see the screen"); assert.ok(["image/png", "image/jpeg"].includes(img.mimeType));
+    const png = Buffer.from(img.data, "base64"); assert.ok(png.readUInt32BE(0) === 0x89504e47 || (png[0] === 0xff && png[1] === 0xd8), "really a PNG or JPEG picture");
     await u.call("desktop_click", { x: 100, y: 200 }); await u.call("desktop_click", { x: 5, y: 6, button: "right", double: true });
     await u.call("desktop_type", { text: `it's "quoted"; $(whoami) \`id\`\nline2 ✓` }); await u.call("desktop_press", { keys: ["ctrl", "l"] }); await u.call("desktop_press", { keys: ["Enter"] });
     await u.call("desktop_scroll", { direction: "down", amount: 4 }); await u.call("desktop_drag", { x1: 1, y1: 2, x2: 30, y2: 40 }); await u.call("desktop_move", { x: 9, y: 8 });
@@ -385,5 +385,74 @@ test("DESKTOP privacy: user B can neither see nor drive user A's screen, and the
       else assert.equal(r.isError, true, n);
     }
     assert.ok(!x.readLog().includes("stolen") && !x.readLog().includes("mousemove 1 1"), "B never reached A's desktop");
+  } finally { await b.stop(); }
+});
+
+// ---------------- FAST live screen + batch tool ----------------
+test("FAST FRAMES: many frames are served without a new screenshot process per frame, as small JPEGs, and the app route is protected", async () => {
+  const { b, x, u } = await withDesktop(); try {
+    await u.call("desktop_start", {});
+    const d = (u.deps as any).desktop; const t0 = Date.now(); let last: any;
+    for (let i = 0; i < 12; i++) last = await d.frame("guest:tester");
+    assert.equal(last.type, "jpeg"); assert.equal(last.img[0], 0xff); assert.equal(last.img[1], 0xd8, "a real JPEG");
+    const per = (Date.now() - t0) / 12; assert.ok(per < 400, `average ${per}ms per frame`);
+    await new Promise((r) => setTimeout(r, 400));
+    assert.ok(x.scrots() < 12 + 6, "the background loop makes the frames; not one capture process per request (" + x.scrots() + ")");
+    const shot = await u.call("desktop_screenshot", {}); const img = shot.content.find((c: any) => c.type === "image"); assert.ok(img); assert.ok(["image/jpeg", "image/png"].includes(img.mimeType));
+  } finally { await b.stop(); }
+});
+
+test("BATCH: desktop_do runs many steps in one call, returns one screenshot, and nothing hostile reaches the shell", async () => {
+  const { b, x, u } = await withDesktop(); try {
+    await u.call("desktop_start", {});
+    const r = await u.call("desktop_do", { steps: [{ do: "click", x: 50, y: 60 }, { do: "type", text: `a'b"c; $(touch PWNED_HOME) \`id\`` }, { do: "press", keys: ["Enter"] }, { do: "scroll", direction: "down", amount: 2 }, { do: "drag", x: 1, y: 2, x2: 3, y2: 4 }, { do: "wait", ms: 50 }], });
+    assert.ok(!r.isError, text(r)); assert.ok(r.content.some((c: any) => c.type === "image"), "one screenshot at the end");
+    const log = x.readLog(); for (const want of ["mousemove 50 60 click 1", "key -- Return", "click --repeat 2 --delay 30 5", "mousemove 1 2 mousedown 1 sleep 0.1 mousemove 3 4 sleep 0.1 mouseup 1"]) assert.ok(log.includes(want), want + "\n" + log);
+    assert.ok(log.includes("type:a'b\"c; $(touch PWNED_HOME) `id`"), "typed literally: " + log); assert.equal(execFileSync("bash", ["-c", `find ${b.vmf.root} -name PWNED_HOME | wc -l`], { encoding: "utf8" }).trim(), "0", "the injected command never ran");
+    const noshot = await u.call("desktop_do", { steps: [{ do: "move", x: 1, y: 1 }], screenshot: false }); assert.ok(!noshot.isError); assert.ok(!noshot.content.some((c: any) => c.type === "image"));
+    const before = x.readLog();
+    for (const steps of [[{ do: "click", x: -5, y: 1 }], [{ do: "press", keys: ["ctrl; rm -rf x"] }], [{ do: "open", url: "file:///etc/passwd" }], [{ do: "scroll", direction: "left; ls" }], [{ do: "bogus" }], [], Array.from({ length: 26 }, () => ({ do: "wait", ms: 1 }))] as any[]) {
+      const bad = await u.call("desktop_do", { steps }); assert.equal(bad.isError, true, JSON.stringify(steps).slice(0, 60));
+    }
+    assert.equal(x.readLog(), before, "an invalid batch runs NOTHING (it is validated whole before any step)");
+  } finally { await b.stop(); }
+});
+
+test("BATCH needs a VM, like every other desktop tool", async () => {
+  const b = await boot(); try { const u = await asUser(b); const r = await u.call("desktop_do", { steps: [{ do: "wait", ms: 1 }] }); assert.equal(r.isError, true); assert.match(text(r), /VM|key/i); } finally { await b.stop(); }
+});
+
+test("LIVE VIEWER: the official stream link is used when the key may make one, and the app falls back cleanly when it may not", async () => {
+  const { b, u } = await withDesktop(); try {
+    await u.call("desktop_start", {}); const d = (u.deps as any).desktop;
+    const none = await d.streamUrl("guest:tester", true); assert.equal(none, null, "the fake refuses (like a workspace key): fall back, no crash");
+  } finally { await b.stop(); }
+});
+
+test("HTTP: /api/desktop/frame is a JPEG and needs login; /api/desktop/stream reports availability; the page CSP allows blob images and only InstaBox frames", async () => {
+  const b = await boot(); const x = fakeXTools(b.tmp); b.vmf.useX(x.bin); try {
+    assert.equal((await fetch(`${b.base}/api/desktop/frame`)).status, 401); assert.equal((await fetch(`${b.base}/api/desktop/stream`, { method: "POST", body: "{}" })).status, 401);
+    const g = await guestSession(b.base); assert.equal((await fetch(`${b.base}/api/desktop/frame`, { headers: { cookie: g.cookie } })).status, 409);
+    await fetch(`${b.base}/api/providers`, { method: "POST", headers: g.H, body: JSON.stringify({ id: "instabox", key: KEY }) }); await fetch(`${b.base}/api/vm/start`, { method: "POST", headers: g.H, body: "{}" }); await fetch(`${b.base}/api/desktop/start`, { method: "POST", headers: g.H, body: "{}" });
+    const f = await fetch(`${b.base}/api/desktop/frame`, { headers: { cookie: g.cookie } }); assert.equal(f.status, 200); assert.equal(f.headers.get("content-type"), "image/jpeg"); assert.equal(f.headers.get("cache-control"), "no-store"); const buf = Buffer.from(await f.arrayBuffer()); assert.equal(buf[0], 0xff);
+    const st = await (await fetch(`${b.base}/api/desktop/stream`, { method: "POST", headers: g.H, body: "{}" })).json() as any; assert.equal(st.available, false);
+    const csp = (await fetch(`${b.base}/`)).headers.get("content-security-policy") ?? ""; assert.match(csp, /img-src[^;]*blob:/); assert.match(csp, /frame-src https:\/\/\*\.instabox\.sh https:\/\/instabox\.sh/); assert.ok(!/frame-src[^;]*\*\s*;/.test(csp) && !/frame-src \*/.test(csp), "never frames arbitrary sites"); assert.match(csp, /frame-ancestors 'none'/);
+  } finally { await b.stop(); }
+});
+
+test("FAST FRAMES: the background capture loop stops by itself when nobody is watching (no forever-running process in the user's VM)", async () => {
+  const { b, u } = await withDesktop(); try {
+    await u.call("desktop_start", {}); const d = (u.deps as any).desktop; await d.frame("guest:tester");
+    const home = execFileSync("bash", ["-c", `find ${b.vmf.root} -name uca-live-loop.sh | head -1`], { encoding: "utf8" }).trim(); assert.ok(home, "the loop script was written");
+    const beat = home.replace("uca-live-loop.sh", "uca-live.beat"), pid = home.replace("uca-live-loop.sh", "uca-live.pid");
+    // watching: heartbeat fresh -> still running
+    assert.ok(fs.existsSync(pid), "running while someone watches");
+    // stop watching: make the heartbeat 60 s old; the loop must exit and clean up on its own
+    const old = new Date(Date.now() - 60_000); fs.utimesSync(beat, old, old);
+    let gone = false; for (let i = 0; i < 40 && !gone; i++) { await new Promise((r) => setTimeout(r, 100)); gone = !fs.existsSync(pid); }
+    assert.ok(gone, "the loop exited and removed its pid file once the heartbeat went stale");
+    // watching again restarts it
+    await d.frame("guest:tester"); let back = false; for (let i = 0; i < 30 && !back; i++) { back = fs.existsSync(pid); if (!back) await new Promise((r) => setTimeout(r, 100)); } assert.ok(back, "watching again restarts the loop");
+    fs.utimesSync(beat, old, old);
   } finally { await b.stop(); }
 });

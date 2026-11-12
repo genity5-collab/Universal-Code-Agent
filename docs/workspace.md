@@ -64,6 +64,12 @@ Some VMs have a graphical Linux desktop (InstaBox `agent-browser` does). Use it 
 
 `vm_live` opens a live window in the chat that shows this screen, so the user can watch. The user can also watch and click on it in the app's Workspace tab. If a screenshot fails with "no screenshot tool", run `sudo apt-get update && sudo apt-get install -y scrot xdotool`.
 
+## Be fast on the screen
+
+- Use `desktop_do` for anything with more than one action. It runs up to 25 steps (click, type, press, scroll, drag, wait, open) in ONE call and returns ONE screenshot at the end. Example: click the address bar, type a URL, press Enter, wait 1500 ms: one call.
+- Do not take a screenshot after every tiny action. Take one when you need to decide what to do next.
+- The user watches live in the app and the chat window, so no need to describe the screen to them.
+
 ## Errors you may see
 
 - `No InstaBox key` / `No VM is attached` -> see "Before you do anything".

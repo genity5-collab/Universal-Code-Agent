@@ -10,8 +10,9 @@ export function fakeXTools(dir: string) {
   const bin = path.join(dir, "xbin"); fs.mkdirSync(bin, { recursive: true }); const log = path.join(dir, "xdotool.log");
   fs.writeFileSync(path.join(bin, "xdotool"), `#!/bin/bash\n[ "$DISPLAY" = ":1" ] || { echo "no display" >&2; exit 1; }\nif [ "$1" = getdisplaygeometry ]; then echo "1280 800"; exit 0; fi\nif [ "$1" = type ]; then echo "type:$(cat)" >> ${log}; exit 0; fi\necho "$*" >> ${log}\n`, { mode: 0o755 });
   const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAQAAAADCAIAAAA7ljmRAAAAFElEQVR4nGP4z8Dwn4GBgYEBRAAAKB8EAfjB4kQAAAAASUVORK5CYII=", "base64");
-  fs.writeFileSync(path.join(bin, "scrot"), `#!/bin/bash\n[ "$DISPLAY" = ":1" ] || exit 1\nout="\${@: -1}"\nbase64 -d > "$out" <<'EOF'\n${png.toString("base64")}\nEOF\n`, { mode: 0o755 });
-  return { bin, log, readLog: () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8") : "") };
+  const jpg = "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=";
+  fs.writeFileSync(path.join(bin, "scrot"), `#!/bin/bash\n[ "$DISPLAY" = ":1" ] || exit 1\necho x >> ${path.join(dir, "scrot.count")}\nout="\${@: -1}"\ncase "$*" in *-q*) base64 -d > "$out" <<'EOJ'\n${jpg}\nEOJ\n;; *) base64 -d > "$out" <<'EOF'\n${png.toString("base64")}\nEOF\n;; esac\n`, { mode: 0o755 });
+  return { bin, log, scrots: () => (fs.existsSync(path.join(dir, "scrot.count")) ? fs.readFileSync(path.join(dir, "scrot.count"), "utf8").split("\n").filter(Boolean).length : 0), readLog: () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8") : "") };
 }
 export function fakeInstaBox() {
   let xbin = ""; const useX = (b: string) => { xbin = b; };

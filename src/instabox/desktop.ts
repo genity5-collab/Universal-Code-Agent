@@ -17,6 +17,11 @@ export const keysym = (k: string): string => { const s = String(k).trim(); const
 const int = (v: unknown, name: string, lo: number, hi: number): number => { const n = Number(v); if (!Number.isInteger(n) || n < lo || n > hi) throw new Error(`${name} must be a whole number from ${lo} to ${hi}.`); return n; };
 const BUTTON: Record<string, number> = { left: 1, middle: 2, right: 3 }; const WHEEL: Record<string, number> = { up: 4, down: 5, left: 6, right: 7 };
 
+/** Width and height from a JPEG's SOF marker, or undefined. */
+export function jpegSize(b: Buffer): { width: number; height: number } | undefined {
+  let i = 2; while (i + 9 < b.length) { if (b[i] !== 0xff) { i++; continue; } const m = b[i + 1]; if (m === 0xd8 || m === 0x01 || (m >= 0xd0 && m <= 0xd7)) { i += 2; continue; } const len = b.readUInt16BE(i + 2); if ((m >= 0xc0 && m <= 0xcf) && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) return { height: b.readUInt16BE(i + 5), width: b.readUInt16BE(i + 7) }; i += 2 + len; }
+  return undefined;
+}
 export interface DesktopStatus { running: boolean; width?: number; height?: number; installed: boolean }
 export const MAX_SHOT_BYTES = 6 * 1024 * 1024;
 
@@ -61,6 +66,33 @@ export class Desktop {
     finally { await this.mgr.exec(userId, `rm -f ${shq(p)}`, { timeoutSec: 10 }).catch(() => undefined); }
   }
 
+  /**
+   * FAST FRAMES. One small background loop INSIDE the VM keeps overwriting a JPEG (about 6 per second); reading a frame is then one cheap
+   * file download instead of: spawn shell, start scrot, encode PNG, download, delete. The loop stops itself when nobody asks for a frame for 20 s.
+   */
+  private static FRAME = "/tmp/uca-live.jpg"; private static BEAT = "/tmp/uca-live.beat";
+  async frame(userId: string): Promise<{ img: Buffer; type: "jpeg" | "png"; width?: number; height?: number }> {
+    const F = shq(Desktop.FRAME), B = shq(Desktop.BEAT), S = "/tmp/uca-live-loop.sh", PID = "/tmp/uca-live.pid";
+    // The loop is a small script file (no quoting tricks). It runs while the heartbeat is fresh and removes its pid file when it stops.
+    const script = `#!/bin/bash\nexport DISPLAY=:1\necho $$ > ${PID}\nwhile [ $(( $(date +%s) - $(stat -c %Y ${Desktop.BEAT} 2>/dev/null || echo 0) )) -lt 20 ]; do\n  if command -v scrot >/dev/null; then scrot -q 55 -o ${Desktop.FRAME}.tmp 2>/dev/null && mv -f ${Desktop.FRAME}.tmp ${Desktop.FRAME}; else import -window root -quality 55 jpg:${Desktop.FRAME}.tmp 2>/dev/null && mv -f ${Desktop.FRAME}.tmp ${Desktop.FRAME}; fi\n  sleep 0.12\ndone\nrm -f ${PID}\n`;
+    const loop = `touch ${B}; if ! { [ -s ${PID} ] && kill -0 "$(cat ${PID})" 2>/dev/null; }; then printf %s ${shq(script)} > ${S} && chmod +x ${S} && (setsid nohup ${S} >/dev/null 2>&1 </dev/null &); fi; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s ${F} ] && break; sleep 0.1; done; [ -s ${F} ]`;
+    const r = await this.sh(userId, loop, 15);
+    if (r.exitCode !== 0) { const s = await this.screenshot(userId); return { img: s.png, type: "png", width: s.width, height: s.height }; } // slow but always works
+    const img = await this.mgr.readFile(userId, Desktop.FRAME, MAX_SHOT_BYTES);
+    if (img.length > 3 && img[0] === 0xff && img[1] === 0xd8) return { img, type: "jpeg", ...jpegSize(img) };
+    if (img.length > 8 && img.readUInt32BE(0) === 0x89504e47) return { img, type: "png", width: img.readUInt32BE(16), height: img.readUInt32BE(20) };
+    throw new Error("The frame was not an image.");
+  }
+
+  /** InstaBox's own real-time viewer link (only the machine creator's personal key may make one). Returns null when the key is not allowed to. */
+  async streamUrl(userId: string, viewOnly: boolean): Promise<{ url: string; expiresAt: string } | null> {
+    try {
+      const body = await this.mgr.rawCall(userId, "POST", "desktop/stream", { viewOnly, ttlSeconds: 1800 }, 20_000);
+      const j = JSON.parse(body); if (typeof j.url !== "string" || !/^https:\/\//.test(j.url)) return null;
+      return { url: j.url, expiresAt: String(j.expiresAt ?? "") };
+    } catch (e: any) { if (/permission|forbidden|lacks a permission|404|not.*found|no longer exists|HTTP 4\d\d/i.test(String(e?.message))) return null; throw e; }
+  }
+
   private async xdo(userId: string, args: string, stdin?: string) {
     const cmd = stdin === undefined ? `xdotool ${args}` : `printf %s ${shq(stdin)} | xdotool ${args}`;
     const r = await this.sh(userId, cmd); if (r.exitCode !== 0) throw new Error(/not found/.test(r.stderr) ? "xdotool is missing in the VM. Run: sudo apt-get update && sudo apt-get install -y xdotool" : `Input failed. Is the desktop started? Call desktop_start. ${r.stderr.slice(0, 200)}`); return r;
@@ -71,6 +103,7 @@ export class Desktop {
   async scroll(u: string, dir: string, amount = 3) { const w = WHEEL[dir]; if (!w) throw new Error("direction must be up, down, left or right."); await this.xdo(u, `click --repeat ${int(amount, "amount", 1, 100)} --delay 30 ${w}`); }
   async type(u: string, text: string) { if (typeof text !== "string" || !text) return; if (text.length > 5000) throw new Error("Type at most 5000 characters at a time."); await this.xdo(u, `type --delay 12 --file -`, text); }
   async press(u: string, keys: string[]) { if (!keys.length || keys.length > 6) throw new Error("Give 1 to 6 keys."); await this.xdo(u, `key -- ${shq(keys.map(keysym).join("+"))}`); }
+  async runBatch(userId: string, script: string) { return this.sh(userId, script, 60); }
   async open(u: string, url: string) {
     let parsed: URL; try { parsed = new URL(url); } catch { throw new Error("Invalid URL."); } if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("Only http and https URLs can be opened.");
     const r = await this.sh(u, `b=$(command -v chromium || command -v chromium-browser || command -v google-chrome) || { echo 'no browser in the VM' >&2; exit 127; }; setsid nohup "$b" --no-first-run --no-default-browser-check --password-store=basic ${shq(parsed.href)} >/dev/null 2>&1 </dev/null &`); if (r.exitCode !== 0) throw new Error("No browser is installed in this VM.");
@@ -85,11 +118,37 @@ const D = (d: ToolDeps) => (d as DeskDeps).desktop;
 const log = (d: ToolDeps, c: UserContext, tool: string, summary: string, ok = true) => (d as DeskDeps).feed.add(c.userId, { tool, kind: "other", summary, ok });
 const need = (d: ToolDeps, c: UserContext) => { if (!d.vm || !(d as DeskDeps).desktop) throw new NoVmError("VM backend is not configured on this server, so the AI cannot work."); d.vm.require(c.userId); };
 
+export interface Step { do: string; x?: number; y?: number; x2?: number; y2?: number; text?: string; keys?: string[]; direction?: string; amount?: number; button?: string; double?: boolean; ms?: number; url?: string }
+/** Turn a list of steps into ONE xdotool shell script. Every number is validated; every string is quoted. */
+export function buildBatch(steps: Step[]): string {
+  if (!Array.isArray(steps) || !steps.length || steps.length > 25) throw new Error("Give 1 to 25 steps.");
+  const out: string[] = [];
+  for (const st of steps) {
+    switch (st.do) {
+      case "click": { const b = BUTTON[st.button ?? "left"]; if (!b) throw new Error("button must be left, right or middle."); out.push(`xdotool mousemove ${int(st.x, "x", 0, 10000)} ${int(st.y, "y", 0, 10000)} click${st.double ? " --repeat 2 --delay 80" : ""} ${b}`); break; }
+      case "move": out.push(`xdotool mousemove ${int(st.x, "x", 0, 10000)} ${int(st.y, "y", 0, 10000)}`); break;
+      case "drag": out.push(`xdotool mousemove ${int(st.x, "x", 0, 10000)} ${int(st.y, "y", 0, 10000)} mousedown 1 sleep 0.1 mousemove ${int(st.x2, "x2", 0, 10000)} ${int(st.y2, "y2", 0, 10000)} sleep 0.1 mouseup 1`); break;
+      case "scroll": { const w = WHEEL[String(st.direction)]; if (!w) throw new Error("direction must be up, down, left or right."); out.push(`xdotool click --repeat ${int(st.amount ?? 3, "amount", 1, 100)} --delay 30 ${w}`); break; }
+      case "type": { if (typeof st.text !== "string" || !st.text || st.text.length > 5000) throw new Error("type needs text of 1 to 5000 characters."); out.push(`printf %s ${shq(st.text)} | xdotool type --delay 8 --file -`); break; }
+      case "press": { const k = st.keys ?? []; if (!k.length || k.length > 6) throw new Error("press needs 1 to 6 keys."); out.push(`xdotool key -- ${shq(k.map(keysym).join("+"))}`); break; }
+      case "wait": out.push(`sleep ${(int(st.ms ?? 300, "ms", 0, 5000) / 1000).toFixed(3)}`); break;
+      case "open": { let u: URL; try { u = new URL(String(st.url)); } catch { throw new Error("Invalid URL."); } if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("Only http and https URLs can be opened."); out.push(`b=$(command -v chromium || command -v chromium-browser || command -v google-chrome) || { echo 'no browser in the VM' >&2; exit 127; }; (setsid nohup "$b" --no-first-run --no-default-browser-check --password-store=basic ${shq(u.href)} >/dev/null 2>&1 </dev/null &)`); break; }
+      default: throw new Error(`Unknown step "${String(st.do).slice(0, 20)}". Use click, move, drag, scroll, type, press, wait or open.`);
+    }
+  }
+  return "set -e; " + out.join("; ");
+}
+
 export const DESKTOP_TOOLS: ToolDef[] = [
+  { name: "desktop_do", title: "Do several things on the VM screen at once (fast)", description: "PREFERRED. Run up to 25 steps in ONE call and get ONE screenshot at the end. Much faster than separate calls. Steps: {do:\"click\",x,y,button?,double?}, {do:\"type\",text}, {do:\"press\",keys:[\"ctrl\",\"l\"]}, {do:\"scroll\",direction,amount?}, {do:\"drag\",x,y,x2,y2}, {do:\"move\",x,y}, {do:\"wait\",ms}, {do:\"open\",url}. Example: click the address bar, type a URL, press Enter, wait 1500, all in one call. " + SHOT_NOTE, scope: "mcp:exec", readOnly: false,
+    shape: { steps: z.array(z.object({ do: z.enum(["click", "move", "drag", "scroll", "type", "press", "wait", "open"]), x: z.number().int().min(0).max(10000).optional(), y: z.number().int().min(0).max(10000).optional(), x2: z.number().int().min(0).max(10000).optional(), y2: z.number().int().min(0).max(10000).optional(), text: z.string().max(5000).optional(), keys: z.array(z.string().min(1).max(20)).max(6).optional(), direction: z.enum(["up", "down", "left", "right"]).optional(), amount: z.number().int().min(1).max(100).optional(), button: z.enum(["left", "right", "middle"]).optional(), double: z.boolean().optional(), ms: z.number().int().min(0).max(5000).optional(), url: z.string().max(2000).optional() })).min(1).max(25), screenshot: z.boolean().optional() },
+    handler: async (a, c, d) => { need(d, c); const script = buildBatch(a.steps); const r = await D(d).runBatch(c.userId, script); if (r.exitCode !== 0) throw new Error(`A step failed: ${r.stderr.slice(0, 200) || "unknown"}. Is the desktop started? Call desktop_start.`); log(d, c, "desktop_do", `${a.steps.length} step(s): ${a.steps.map((s: Step) => s.do).join(", ").slice(0, 120)}`);
+      if (a.screenshot === false) return { done: a.steps.length };
+      const f = await D(d).frame(c.userId); return { __image: f.img.toString("base64"), __mime: f.type === "jpeg" ? "image/jpeg" : "image/png", __structured: { steps: a.steps.length, takenAt: Date.now() }, text: `Done ${a.steps.length} step(s). Screenshot attached. ${SHOT_NOTE}` }; } },
   { name: "desktop_start", title: "Start the VM desktop", description: "Start the VM's Linux desktop screen (installs it first if the VM template lacks it, about 30 s). Call once before using the screen. Then call desktop_screenshot to see it.", scope: "mcp:exec", readOnly: false, shape: { width: z.number().int().min(800).max(2560).optional(), height: z.number().int().min(600).max(1600).optional() },
     handler: async (a, c, d) => { need(d, c); const s = await D(d).start(c.userId, a.width, a.height); return { running: s.running, width: s.width, height: s.height, next: "Call desktop_screenshot to see the screen." }; } },
-  { name: "desktop_screenshot", title: "See the VM screen", description: "Take a screenshot of the VM's desktop and return it as an image. Use it before and after every click or key press to check what happened. " + SHOT_NOTE, scope: "mcp:read", readOnly: true, shape: {},
-    handler: async (_a, c, d) => { need(d, c); const s = await D(d).screenshot(c.userId); log(d, c, "desktop_screenshot", `Screenshot ${s.width}x${s.height}`); return { __image: s.png.toString("base64"), __structured: { width: s.width, height: s.height, takenAt: Date.now() }, text: `Screenshot ${s.width}x${s.height}. ${SHOT_NOTE}` }; } },
+  { name: "desktop_screenshot", title: "See the VM screen", description: "Take a screenshot of the VM's desktop and return it as an image. " + SHOT_NOTE + " Prefer desktop_do for several actions, it returns a screenshot at the end.", scope: "mcp:read", readOnly: true, shape: {},
+    handler: async (_a, c, d) => { need(d, c); const f = await D(d).frame(c.userId); log(d, c, "desktop_screenshot", "Screenshot"); return { __image: f.img.toString("base64"), __mime: f.type === "jpeg" ? "image/jpeg" : "image/png", __structured: { width: f.width, height: f.height, takenAt: Date.now() }, text: `Screenshot attached. ${SHOT_NOTE}` }; } },
   { name: "desktop_click", title: "Click on the VM screen", description: "Click at (x, y) on the VM screen. " + SHOT_NOTE + " Take a screenshot afterwards to check the result.", scope: "mcp:exec", readOnly: false, shape: { x: z.number().int().min(0).max(10000), y: z.number().int().min(0).max(10000), button: z.enum(["left", "right", "middle"]).optional(), double: z.boolean().optional() },
     handler: async (a, c, d) => { need(d, c); await D(d).click(c.userId, a.x, a.y, a.button ?? "left", !!a.double); log(d, c, "desktop_click", `${a.double ? "Double-click" : "Click"} ${a.button ?? "left"} at ${a.x},${a.y}`); return { clicked: true }; } },
   { name: "desktop_move", title: "Move the mouse on the VM screen", description: "Move the pointer to (x, y) without clicking.", scope: "mcp:exec", readOnly: false, shape: { x: z.number().int().min(0).max(10000), y: z.number().int().min(0).max(10000) },

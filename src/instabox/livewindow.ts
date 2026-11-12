@@ -15,7 +15,7 @@ import { WORKSPACE_DIR } from "./tools.js";
 import { shq } from "./client.js";
 import type { Desktop } from "./desktop.js";
 
-export const LIVE_URI = "ui://widget/vm-live-v2.html";
+export const LIVE_URI = "ui://widget/vm-live-v3.html";
 export const LIVE_MIME = "text/html;profile=mcp-app";
 
 type Snap = { running: boolean; machineId?: string; items: unknown[]; lastId: number; files: { name: string; type: string; size: number }[]; usedBytes: number };
@@ -39,7 +39,7 @@ async function snapshot(c: { userId: string }, d: any, since: number, withFiles:
 /** Latest picture of the VM desktop as a data URL, or a short reason it is not available. Never throws. */
 async function screen(c: { userId: string }, d: any): Promise<{ image?: string; width?: number; height?: number; note?: string }> {
   if (!d.vm.status(c.userId).running) return { note: "The VM is not running." };
-  try { const s = await (d.desktop as Desktop).screenshot(c.userId); return { image: "data:image/png;base64," + s.png.toString("base64"), width: s.width, height: s.height }; }
+  try { const f = await (d.desktop as Desktop).frame(c.userId); return { image: `data:image/${f.type};base64,` + f.img.toString("base64"), width: f.width, height: f.height }; }
   catch (e: any) { return { note: /no screenshot tool|Is the desktop started|xdotool|scrot/i.test(String(e?.message)) ? "The desktop is not started yet. The AI can start it with desktop_start." : "Screen not available right now." }; }
 }
 
@@ -114,7 +114,7 @@ details{border-top:1px solid var(--line)}summary{cursor:pointer;padding:6px 10px
   }
   function showScreen(sc){
     if(!sc)return;
-    if(sc.image&&typeof sc.image==="string"&&sc.image.indexOf("data:image/png;base64,")===0&&!/[^A-Za-z0-9+=]/.test(sc.image.slice(22).split("/").join(""))){img.src=sc.image;img.hidden=false;msg.hidden=true}
+    if(sc.image&&typeof sc.image==="string"&&(sc.image.indexOf("data:image/png;base64,")===0||sc.image.indexOf("data:image/jpeg;base64,")===0)&&!/[^A-Za-z0-9+=]/.test(sc.image.slice(sc.image.indexOf(",")+1).split("/").join(""))){img.src=sc.image;img.hidden=false;msg.hidden=true}
     else if(sc.note){if(img.hidden){msg.textContent=sc.note;msg.hidden=false}}
   }
   function render(s){
@@ -132,8 +132,9 @@ details{border-top:1px solid var(--line)}summary{cursor:pointer;padding:6px 10px
   async function pollFeed(){try{var r=await request("tools/call",{name:"vm_live_poll",arguments:{sinceId:last,files:tick%4===0}});render(fromResult(r))}catch(e){foot.textContent="Reconnecting..."}}
   async function loop(){
     if(busy||paused)return;busy=true;tick++;
-    await pollScreen(); if(tick%2===0)await pollFeed();
+    await pollScreen(); if(tick%6===0)await pollFeed();
     busy=false;
+    if(!paused)setTimeout(loop,60);
   }
   window.addEventListener("message",function(ev){
     var m=ev.data;if(!m||m.jsonrpc!=="2.0")return;
@@ -144,8 +145,8 @@ details{border-top:1px solid var(--line)}summary{cursor:pointer;padding:6px 10px
   pauseBtn.onclick=function(){paused=!paused;pauseBtn.textContent=paused?"Resume":"Pause";if(!paused)loop()};
   function size(){notify("ui/notifications/size-changed",{width:document.documentElement.scrollWidth,height:document.documentElement.scrollHeight})}
   if(window.ResizeObserver)new ResizeObserver(size).observe(document.body);
-  request("ui/initialize",{appInfo:{name:"Live VM",version:"2.0.0"},appCapabilities:{},protocolVersion:"2026-01-26"})
-    .then(function(){notify("ui/notifications/initialized");size();setInterval(loop,1500);loop()})
+  request("ui/initialize",{appInfo:{name:"Live VM",version:"2.1.0"},appCapabilities:{},protocolVersion:"2026-01-26"})
+    .then(function(){notify("ui/notifications/initialized");size();loop()})
     .catch(function(){msg.textContent="This chat app cannot show the live screen. Open the Workspace tab in the app instead.";msg.hidden=false});
 })();
 </script></html>`;
