@@ -4,14 +4,18 @@
   "description": "Universal MCP coding-agent connector: GitHub, filesystem, sandboxed terminal, Codespaces, mobile dashboard.",
   "license": "MIT",
   "type": "module",
-  "main": "dist/index.js",
-  "bin": { "universal-code-agent": "dist/cli.js" },
-  "engines": { "node": ">=20" },
+  "main": "dist/src/index.js",
+  "bin": {
+    "universal-code-agent": "dist/src/cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "start": "node dist/cli.js http",
-    "start:stdio": "node dist/cli.js stdio",
+    "start": "node dist/src/cli.js http",
+    "start:stdio": "node dist/src/cli.js stdio",
     "test": "npm run build && node --test --test-concurrency=1 dist/test/*.test.js",
     "dev": "tsc -w -p tsconfig.json"
   },

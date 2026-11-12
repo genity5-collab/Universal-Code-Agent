@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f17">
+<link rel="manifest" href="/manifest.webmanifest">
+<title>Universal Code Agent</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header id="top"><div class="brand"><span class="logo">&lt;/&gt;</span><span id="title">Universal Code Agent</span></div><span id="conn" class="pill off">offline</span></header>
+<main id="view" aria-live="polite"></main>
+<nav id="tabs" role="tablist" aria-label="Sections">
+  <button data-tab="repos" class="active"><i>&#128193;</i><span>Repos</span></button>
+  <button data-tab="editor"><i>&#9998;</i><span>Editor</span></button>
+  <button data-tab="tasks"><i>&#9889;</i><span>Tasks</span></button>
+  <button data-tab="terminal"><i>&#9000;</i><span>Terminal</span></button>
+  <button data-tab="approvals"><i>&#10003;</i><span>Approvals</span><b id="badge" hidden>0</b></button>
+  <button data-tab="settings"><i>&#9881;</i><span>Settings</span></button>
+</nav>
+<script src="/app.js"></script>
+</body>
+</html>
