@@ -39,7 +39,13 @@ function go(tab) {
   document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   ({ repos, editor, tasks, terminal, codespaces, approvals, settings }[tab])();
 }
-function needLogin() {
+async function needLogin() {
+  let st = {}; try { st = await (await fetch("/api/setup-status")).json(); } catch {}
+  if (st.guestMode && !st.githubConfigured) {
+    view.innerHTML = `<div class="card"><h2>Welcome</h2><p class="muted">No account or API key needed. Tap below to get a private guest workspace, then add your connector link to your AI app.</p><button id="gb" class="btn" style="width:100%;padding:14px;font-size:16px">Continue as guest</button><p id="gm" class="err"></p><p style="margin-top:10px"><a href="/setup">How to connect my AI</a></p></div>`;
+    $("#gb").onclick = async () => { $("#gb").disabled = true; try { const r = await fetch("/auth/guest", { method: "POST" }); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "Failed"); location.reload(); } catch (e) { $("#gm").textContent = e.message; $("#gb").disabled = false; } };
+    return;
+  }
   view.innerHTML = `<div class="card"><h2>Connect GitHub</h2><p class="muted">Sign in with your own GitHub account. No AI API keys are needed or stored.</p><a class="btn" style="display:inline-block;text-decoration:none;padding:12px 16px;border-radius:10px;background:var(--accent);color:#fff" href="/auth/github/login">Sign in with GitHub</a></div>`;
 }
 

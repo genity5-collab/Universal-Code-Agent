@@ -19,6 +19,9 @@ export interface Config {
   rateLimitPerMin: number;
   /** When true, sensitive ops (delete, push, exec of non-safe commands) need human approval. */
   requireApproval: boolean;
+  /** Guest mode: no GitHub app or keys needed. On by default only when GitHub OAuth is NOT configured. */
+  allowGuests: boolean;
+  maxGuests: number;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -41,6 +44,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxOutputBytes: Number(env.UCA_MAX_OUTPUT ?? 200000),
     rateLimitPerMin: Number(env.UCA_RATE_LIMIT ?? 240),
     requireApproval: (env.UCA_REQUIRE_APPROVAL ?? "true") !== "false",
+    allowGuests: env.UCA_ALLOW_GUESTS != null ? env.UCA_ALLOW_GUESTS === "true" : !(env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET),
+    maxGuests: Number(env.UCA_MAX_GUESTS ?? 5),
   };
 }
 export const homeDir = os.homedir();

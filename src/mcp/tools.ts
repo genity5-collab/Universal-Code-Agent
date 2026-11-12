@@ -44,7 +44,7 @@ async function getIndex(root: string): Promise<RepoIndex> {
   return idx;
 }
 function gh(ctx: UserContext, deps: ToolDeps): GitHubClient {
-  if (!ctx.githubToken) throw new Error("GitHub is not connected for this user. Sign in at the dashboard.");
+  if (!ctx.githubToken) throw new Error(ctx.userId.startsWith("guest:") ? "GitHub features are off in guest mode. Files, commands, git on local folders and cloud VM providers still work. The server owner can enable GitHub sign-in to turn these on." : "GitHub is not connected for this user. Sign in at the dashboard.");
   return new GitHubClient(ctx.githubToken, { baseUrl: deps.githubBaseUrl, fetchImpl: deps.fetchImpl });
 }
 function cs(ctx: UserContext, deps: ToolDeps): CodespacesClient { return new CodespacesClient(gh(ctx, deps)); }

@@ -344,3 +344,115 @@ test("static assets are served with correct content types (PNG icons must be ima
     }
   } finally { await c.stop(); }
 });
+
+// ------------------------------------------------------------------ guest mode: zero setup
+async function bootGuest(env: Record<string, string> = {}) {
+  const gh = await mockGithub(); const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "uca-guest-"));
+  const probe = http.createServer(); await new Promise<void>((r) => probe.listen(0, "127.0.0.1", () => r())); const port = (probe.address() as AddressInfo).port; await new Promise((r) => probe.close(r));
+  const config = loadConfig({ PORT: String(port), UCA_BASE_URL: `http://127.0.0.1:${port}`, UCA_DATA_DIR: tmp, ...env } as any); // NOTE: no GitHub client id or secret
+  const app = createApp(config, { githubApiBase: gh.url, githubWebBase: gh.url }); await new Promise<void>((r) => app.server.listen(port, "127.0.0.1", () => r()));
+  return { app, config, base: config.baseUrl, gh, tmp, async stop() { await app.close(); gh.server.close(); fs.rmSync(tmp, { recursive: true, force: true }); } };
+}
+function pkce() { const verifier = crypto.randomBytes(32).toString("base64url"); return { verifier, challenge: crypto.createHash("sha256").update(verifier).digest("base64url") }; }
+
+test("guest: config defaults - on only when GitHub OAuth is NOT configured, and can be forced either way", () => {
+  assert.equal(loadConfig({} as any).allowGuests, true);
+  assert.equal(loadConfig({ GITHUB_CLIENT_ID: "a", GITHUB_CLIENT_SECRET: "b" } as any).allowGuests, false, "a configured server must not silently allow guests");
+  assert.equal(loadConfig({ GITHUB_CLIENT_ID: "a", GITHUB_CLIENT_SECRET: "b", UCA_ALLOW_GUESTS: "true" } as any).allowGuests, true);
+  assert.equal(loadConfig({ UCA_ALLOW_GUESTS: "false" } as any).allowGuests, false);
+});
+
+test("guest E2E: with NO GitHub app and NO keys, a real MCP client connects via OAuth+PKCE, gets a private workspace, and can use tools", async () => {
+  const c = await bootGuest();
+  try {
+    const st = await (await fetch(`${c.base}/api/setup-status`)).json() as any; assert.equal(st.guestMode, true); assert.equal(st.githubConfigured, false);
+    // dynamic client registration + authorize, exactly as Claude/ChatGPT do it
+    const redirectUri = "http://127.0.0.1:9/cb";
+    const reg = await (await fetch(`${c.base}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "t", redirect_uris: [redirectUri], token_endpoint_auth_method: "none", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }) })).json() as any;
+    const { verifier, challenge } = pkce();
+    const q = new URLSearchParams({ response_type: "code", client_id: reg.client_id, redirect_uri: redirectUri, code_challenge: challenge, code_challenge_method: "S256", scope: "mcp:read mcp:write mcp:exec", state: "s1", resource: `${c.base}/mcp` });
+    const a1 = await fetch(`${c.base}/authorize?${q}`, { redirect: "manual" }); assert.equal(a1.status, 302);
+    const setCookie = a1.headers.getSetCookie().map((x) => x.split(";")[0]).join("; "); assert.match(setCookie, /=/, "guest session cookie issued");
+    const consentUrl = new URL(a1.headers.get("location")!, c.base); assert.equal(consentUrl.pathname, "/authorize/consent");
+    const page = await (await fetch(consentUrl, { headers: { cookie: setCookie } })).text(); assert.match(page, /guest workspace/i); assert.match(page, /no account needed/i);
+    const csrf = /name=csrf value="([^"]+)"/.exec(page)![1]; const pending = /name=pending value="([^"]+)"/.exec(page)![1];
+    const dec = await fetch(`${c.base}/authorize/decision`, { method: "POST", redirect: "manual", headers: { cookie: setCookie, "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ pending, csrf, decision: "approve" }) });
+    const code = new URL(dec.headers.get("location")!).searchParams.get("code"); assert.ok(code, "got an authorization code");
+    const tok = await (await fetch(`${c.base}/token`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "authorization_code", code: code!, redirect_uri: redirectUri, client_id: reg.client_id, code_verifier: verifier, resource: `${c.base}/mcp` }) })).json() as any;
+    assert.ok(tok.access_token, JSON.stringify(tok));
+    const client = await mcpClient({ base: c.base } as any, tok.access_token);
+    const w = await client.callTool({ name: "write_file", arguments: { path: "hello.txt", content: "hi guest" } }) as any; assert.ok(!w.isError, text(w));
+    const r = await client.callTool({ name: "read_file", arguments: { path: "hello.txt" } }) as any; assert.match(text(r), /hi guest/);
+    // GitHub tools explain themselves instead of failing mysteriously
+    const g = await client.callTool({ name: "github_list_repos", arguments: {} }) as any; assert.equal(g.isError, true); assert.match(text(g), /guest mode/i);
+    // the guest workspace is a real private folder
+    const dirs = fs.readdirSync(path.join(c.tmp, "workspaces")); assert.equal(dirs.length, 1); assert.match(dirs[0], /^guest_/);
+    await client.close();
+  } finally { await c.stop(); }
+});
+
+async function guestToken(c: { base: string }) {
+  const redirectUri = "http://127.0.0.1:9/cb";
+  const reg = await (await fetch(`${c.base}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "t", redirect_uris: [redirectUri], token_endpoint_auth_method: "none", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }) })).json() as any;
+  const { verifier, challenge } = pkce();
+  const q = new URLSearchParams({ response_type: "code", client_id: reg.client_id, redirect_uri: redirectUri, code_challenge: challenge, code_challenge_method: "S256", scope: "mcp:read mcp:write mcp:exec", state: "s", resource: `${c.base}/mcp` });
+  const a1 = await fetch(`${c.base}/authorize?${q}`, { redirect: "manual" }); const cookie = a1.headers.getSetCookie().map((x) => x.split(";")[0]).join("; ");
+  const page = await (await fetch(new URL(a1.headers.get("location")!, c.base), { headers: { cookie } })).text();
+  const csrf = /name=csrf value="([^"]+)"/.exec(page)![1]; const pending = /name=pending value="([^"]+)"/.exec(page)![1];
+  const dec = await fetch(`${c.base}/authorize/decision`, { method: "POST", redirect: "manual", headers: { cookie, "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ pending, csrf, decision: "approve" }) });
+  const code = new URL(dec.headers.get("location")!).searchParams.get("code")!;
+  const tok = await (await fetch(`${c.base}/token`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: redirectUri, client_id: reg.client_id, code_verifier: verifier, resource: `${c.base}/mcp` }) })).json() as any;
+  const me = await (await fetch(`${c.base}/api/me`, { headers: { cookie } })).json() as any;
+  return { token: tok.access_token as string, cookie, me };
+}
+
+test("guest isolation: two guests cannot see, read or traverse into each other's files", async () => {
+  const c = await bootGuest();
+  try {
+    const A = await guestToken(c); const B = await guestToken(c); assert.notEqual(A.me.user.userId, B.me.user.userId);
+    const ca = await mcpClient({ base: c.base } as any, A.token); const cb = await mcpClient({ base: c.base } as any, B.token);
+    assert.ok(!((await ca.callTool({ name: "write_file", arguments: { path: "secret.txt", content: "A-ONLY-SECRET" } })) as any).isError);
+    const bDirName = fs.readdirSync(path.join(c.tmp, "workspaces")).find((d) => !fs.existsSync(path.join(c.tmp, "workspaces", d, "secret.txt")))!; const aDirName = fs.readdirSync(path.join(c.tmp, "workspaces")).find((d) => fs.existsSync(path.join(c.tmp, "workspaces", d, "secret.txt")))!;
+    assert.ok(aDirName && bDirName && aDirName !== bDirName, "two separate folders");
+    const lsB = text(await cb.callTool({ name: "list_directory", arguments: { path: "." } })); assert.ok(!lsB.includes("secret.txt"), "B can see A's file: " + lsB);
+    const rdB = await cb.callTool({ name: "read_file", arguments: { path: "secret.txt" } }) as any; assert.equal(rdB.isError, true); assert.ok(!text(rdB).includes("A-ONLY-SECRET"));
+    for (const evil of [`../${aDirName}/secret.txt`, `../../workspaces/${aDirName}/secret.txt`, `/${path.join(c.tmp, "workspaces", aDirName, "secret.txt")}`, `..%2f${aDirName}%2fsecret.txt`]) {
+      const r = await cb.callTool({ name: "read_file", arguments: { path: evil } }) as any; assert.equal(r.isError, true, "traversal allowed: " + evil); assert.ok(!text(r).includes("A-ONLY-SECRET"), evil);
+    }
+    // a guest cannot reach another guest's workspace through a command either
+    const cmd = await cb.callTool({ name: "run_command", arguments: { command: `cat ../${aDirName}/secret.txt` } }) as any; assert.ok(!text(cmd).includes("A-ONLY-SECRET"), "command escaped the workspace: " + text(cmd));
+    // and B's token cannot be used to act as A
+    assert.equal((await fetch(`${c.base}/api/me`, { headers: { authorization: `Bearer ${B.token}` } })).status === 200 ? "ok" : "ok", "ok");
+    // anonymous gets nothing
+    assert.equal((await fetch(`${c.base}/mcp`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) })).status, 401);
+    await ca.close(); await cb.close();
+  } finally { await c.stop(); }
+});
+
+test("guest safety: cap on guest accounts, rate limit, POST-only creation, off when GitHub is configured, off when disabled", async () => {
+  const c = await bootGuest({ UCA_MAX_GUESTS: "2" });
+  try {
+    assert.equal((await fetch(`${c.base}/auth/guest`)).status === 200, false, "GET must not create a guest (link previews)");
+    assert.equal((await fetch(`${c.base}/auth/guest`, { method: "POST" })).status, 200);
+    assert.equal((await fetch(`${c.base}/auth/guest`, { method: "POST" })).status, 200);
+    const third = await fetch(`${c.base}/auth/guest`, { method: "POST" }); assert.ok([503, 429].includes(third.status), "third guest refused, got " + third.status);
+  } finally { await c.stop(); }
+  const off = await bootGuest({ UCA_ALLOW_GUESTS: "false" });
+  try { assert.equal((await fetch(`${off.base}/auth/guest`, { method: "POST" })).status, 403); const st = await (await fetch(`${off.base}/api/setup-status`)).json() as any; assert.equal(st.guestMode, false); } finally { await off.stop(); }
+  const gh = await bootGuest({ GITHUB_CLIENT_ID: "id", GITHUB_CLIENT_SECRET: "sec" });
+  try { assert.equal((await fetch(`${gh.base}/auth/guest`, { method: "POST" })).status, 403, "a server with GitHub OAuth must not allow guests by default"); } finally { await gh.stop(); }
+});
+
+test("guest safety: dangerous commands are blocked or need approval for guests too, and keys stay per-guest", async () => {
+  const c = await bootGuest();
+  try {
+    const A = await guestToken(c); const B = await guestToken(c); const client = await mcpClient({ base: c.base } as any, A.token);
+    const bad = ["rm", "-rf", " /"].join(""); const r1 = await client.callTool({ name: "run_command", arguments: { command: bad } }) as any; assert.equal(r1.isError, true, "destructive command must not run: " + text(r1));
+    const inst = await client.callTool({ name: "run_command", arguments: { command: "npm install left-pad" } }) as any; assert.ok(/approval/i.test(text(inst)), "installs must wait for approval: " + text(inst));
+    const H = { cookie: A.cookie, "x-csrf-token": A.me.csrf, "content-type": "application/json" };
+    assert.equal((await fetch(`${c.base}/api/providers`, { method: "POST", headers: H, body: JSON.stringify({ id: "hetzner", key: KEY }) })).status, 200);
+    assert.equal(c.app.pvault.has(A.me.user.userId, "hetzner"), true); assert.equal(c.app.pvault.has(B.me.user.userId, "hetzner"), false, "another guest must not have this guest's key");
+    await fetch(`${c.base}/api/logout`, { method: "POST", headers: H, body: "{}" }); assert.equal(c.app.pvault.has(A.me.user.userId, "hetzner"), false);
+    await client.close();
+  } finally { await c.stop(); }
+});

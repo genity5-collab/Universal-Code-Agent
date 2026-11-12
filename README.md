@@ -4,6 +4,14 @@ One MCP server that lets **Claude, ChatGPT, Gemini and any MCP client** work on 
 
 Includes a **mobile-friendly dashboard** (repos, editor, tasks, terminal, approvals, settings).
 
+## Easiest way (phone, no accounts, no keys)
+
+1. Open your server's `/setup` page (for example `https://your-app.onrender.com/setup`).
+2. Copy the connector link shown there (it ends in `/mcp`).
+3. In your AI app add it as a custom connector (Claude: Settings, Connectors, Add custom connector. ChatGPT: Settings, Connectors, Developer mode), then tap **Allow**.
+
+No GitHub OAuth app, no API keys, nothing to install. You get a private **guest workspace** for files and commands. Guest mode is on automatically when GitHub sign-in is not configured. See [docs/guest-mode.md](docs/guest-mode.md) for what it does and its limits.
+
 ## What you get
 - **~70 MCP tools**: filesystem (chunked reads, exact edits, diff), code search and symbol index, repo map and dependency graph, sandboxed commands and background jobs, git, GitHub (repos, files, commits, issues, PRs, reviews, discussions, Actions logs, releases, security alerts), Codespaces.
 - **OAuth 2.1 for MCP**: dynamic client registration, PKCE (S256 only), refresh rotation with reuse detection, token revocation, scopes `mcp:read`, `mcp:write`, `mcp:exec`.

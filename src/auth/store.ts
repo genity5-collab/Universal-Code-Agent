@@ -633,6 +633,9 @@ export class AuthStore {
 
   // ------------------------------------------------------------------ users
 
+  /** Number of users whose id starts with a prefix (used for the guest cap). */
+  countUsers(prefix: string): number { return Object.keys(this.db.users).filter((k) => k.startsWith(prefix)).length; }
+
   upsertUser(user: { userId: string; login: string; name?: string; avatarUrl?: string }): UserRecord {
     const at = this.now();
     const prev = this.db.users[user.userId];

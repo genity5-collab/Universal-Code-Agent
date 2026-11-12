@@ -3,6 +3,15 @@ const esc=(s)=>String(s).replace(/[&<>"']/g,(c)=>({"&":"&amp;","<":"&lt;",">":"&
 const copyRow=(v)=>`<div class="copy"><code>${esc(v)}</code><button class="btn sec" data-copy="${esc(v)}" style="min-width:76px">Copy</button></div>`;
 async function draw(){
   let s; try{ s=await (await fetch("/api/setup-status")).json(); }catch{ document.getElementById("m").innerHTML='<div class="card err">Cannot reach the server.</div>'; return; }
+  if(s.guestMode&&!s.githubConfigured){
+    const st0=document.getElementById("st"); st0.textContent="ready"; st0.className="pill on";
+    document.getElementById("m").innerHTML=
+      `<div class="card step done"><div class="num">1</div><div class="grow"><b>Copy this link</b><p class="muted">This is your connector link. No account, no API key, nothing to install.</p>${copyRow(s.mcpUrl)}</div></div>`+
+      `<div class="card step"><div class="num">2</div><div class="grow"><b>Add it to your AI app</b><ul class="muted" style="padding-left:18px;margin:6px 0"><li><b>Claude</b> (app or claude.ai): Settings, Connectors, Add custom connector, paste the link.</li><li><b>ChatGPT</b>: Settings, Connectors, Advanced, Developer mode, then add the link.</li><li><b>Gemini</b> and others: add it as a remote MCP server with the link.</li></ul></div></div>`+
+      `<div class="card step"><div class="num">3</div><div class="grow"><b>Tap Allow</b><p class="muted">Your AI app opens a page here. Tap <b>Allow</b>. That is all. You get a private guest workspace.</p></div></div>`+
+      `<div class="card"><b>Good to know</b><p class="muted" style="font-size:13px">Guest workspaces are private to you but this server is shared, so do not put secrets in it. Risky actions (deleting, installing, pushing) still wait for your OK in the <a href="/">app</a>. GitHub features turn on if the owner connects a GitHub app.</p></div>`;
+    return;
+  }
   const ready=s.githubConfigured&&!s.needsHttps;
   const st=document.getElementById("st"); st.textContent=ready?"ready":"setup needed"; st.className="pill "+(ready?"on":"off");
   const step=(n,done,title,body)=>`<div class="card step ${done?"done":""}"><div class="num">${done?"&#10003;":n}</div><div class="grow"><b>${title}</b>${body}</div></div>`;

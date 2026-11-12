@@ -1,4 +1,5 @@
 import http from "node:http";
+import nodeCrypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,6 +55,16 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
   const webDir = opts.webDir ?? WEB_DIR;
   const ghAuthorizeUrl = opts.githubWebBase ? `${opts.githubWebBase}/login/oauth/authorize` : undefined;
   const oauthEndpoints = { clientId: config.githubClientId, clientSecret: config.githubClientSecret, fetchImpl, ...(opts.githubWebBase ? { tokenUrl: `${opts.githubWebBase}/login/oauth/access_token` } : {}), ...(opts.githubApiBase ? { apiBaseUrl: opts.githubApiBase } : {}) };
+  const guestCount = () => store.countUsers("guest:");
+  const guestLogin = (req: http.IncomingMessage): { cookie: string } | { error: string; status: number } => {
+    if (!config.allowGuests) return { error: "Guest mode is off.", status: 403 };
+    if (!sessions.loginLimiter.hit(ip(req))) return { error: "Too many attempts. Try again in a minute.", status: 429 };
+    if (guestCount() >= config.maxGuests) return { error: "This server has reached its guest limit.", status: 503 };
+    const userId = "guest:" + nodeCrypto.randomBytes(9).toString("base64url");
+    store.upsertUser({ userId, login: "guest-" + userId.slice(6, 12), name: "Guest" });
+    const s2 = sessions.createSession(userId, { userAgent: String(req.headers["user-agent"] ?? ""), ip: ip(req) });
+    return { cookie: s2.cookie };
+  };
   const authUrl = (state: string) => GHO.buildAuthorizeUrl({ clientId: config.githubClientId, redirectUri: `${config.baseUrl}/auth/github/callback`, scope: config.githubScopes, state, authorizeUrl: ghAuthorizeUrl });
   vault.setRefreshCallback(async (cur) => {
     if (!cur.refreshToken) return null;
@@ -98,7 +109,7 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
       const needsHttps = !config.baseUrl.startsWith("https://") && !/^http:\/\/(localhost|127\.0\.0\.1)/.test(config.baseUrl);
       return send(res, 200, {
         baseUrl: config.baseUrl, mcpUrl: `${config.baseUrl}/mcp`, callbackUrl: `${config.baseUrl}/auth/github/callback`,
-        githubConfigured: !!(config.githubClientId && config.githubClientSecret), https: config.baseUrl.startsWith("https://"), needsHttps,
+        githubConfigured: !!(config.githubClientId && config.githubClientSecret), guestMode: config.allowGuests, https: config.baseUrl.startsWith("https://"), needsHttps,
         persistent: process.env.UCA_PERSISTENT === "true",
         newOAuthAppUrl: "https://github.com/settings/applications/new",
       });
@@ -118,6 +129,10 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
       if (r.redirectTo) return redirect(res, r.redirectTo);
       if (!r.pending) return sendHandler(res, r);
       const sess = sessions.getSession(parseCookies(req.headers.cookie));
+      if (!sess && config.allowGuests && !config.githubClientId) {
+        const g = guestLogin(req); if ("error" in g) return send(res, g.status, `<h1>${escHtml(g.error)}</h1>`);
+        return redirect(res, `/authorize/consent?pending=${encodeURIComponent(r.pending.id)}`, { "set-cookie": g.cookie });
+      }
       if (!sess) {
         const tmp = sessions.createSession("anon:" + r.pending.id); // pre-login session binds the GitHub state
         const st = sessions.createOAuthState(tmp.session.id, { redirectTo: `/authorize/consent?pending=${encodeURIComponent(r.pending.id)}` });
@@ -130,7 +145,7 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
       const pend = store.getPending(pid);
       if (!sess || sess.userId.startsWith("anon:") || !pend || pend.expiresAt < Date.now()) return send(res, 400, "<h1>Authorization request expired. Start again from your AI client.</h1>");
       const client = store.getClient(pend.clientId);
-      const html = `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Authorize</title><style>body{font:16px system-ui;background:#0b0f17;color:#e6edf6;max-width:520px;margin:0 auto;padding:20px}.c{background:#131a26;border:1px solid #243047;border-radius:14px;padding:16px}button{font:inherit;padding:14px 18px;border-radius:10px;border:0;margin:6px 6px 0 0;min-height:48px}.a{background:#4f8cff;color:#fff}.d{background:#1a2333;color:#e6edf6}code{background:#1a2333;padding:2px 6px;border-radius:6px}</style><div class=c><h2>Authorize ${escHtml(client?.clientName ?? pend.clientId)}</h2><p>Signed in as <b>${escHtml(sess.login)}</b>. This AI client will be able to use your GitHub account and workspace through these permissions:</p><ul>${pend.scopes.map((s) => `<li><code>${escHtml(s)}</code></li>`).join("")}</ul><p>Sensitive actions (delete, push, risky commands) still need your approval in the dashboard. You can revoke access any time.</p><form method=post action="/authorize/decision"><input type=hidden name=pending value="${escHtml(pid)}"><input type=hidden name=csrf value="${escHtml(sess.csrfToken)}"><button class=a name=decision value=approve>Allow</button><button class=d name=decision value=deny>Deny</button></form></div>`;
+      const html = `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Authorize</title><style>body{font:16px system-ui;background:#0b0f17;color:#e6edf6;max-width:520px;margin:0 auto;padding:20px}.c{background:#131a26;border:1px solid #243047;border-radius:14px;padding:16px}button{font:inherit;padding:14px 18px;border-radius:10px;border:0;margin:6px 6px 0 0;min-height:48px}.a{background:#4f8cff;color:#fff}.d{background:#1a2333;color:#e6edf6}code{background:#1a2333;padding:2px 6px;border-radius:6px}</style><div class=c><h2>Authorize ${escHtml(client?.clientName ?? pend.clientId)}</h2><p>${sess.userId.startsWith("guest:") ? "You are using a <b>guest workspace</b>: a private folder on this server, no account needed. GitHub features stay off until you sign in with GitHub. This AI client will be able to use it through these permissions:" : "Signed in as <b>" + escHtml(sess.login) + "</b>. This AI client will be able to use your GitHub account and workspace through these permissions:"}</p><ul>${pend.scopes.map((s) => `<li><code>${escHtml(s)}</code></li>`).join("")}</ul><p>Sensitive actions (delete, push, risky commands) still need your approval in the dashboard. You can revoke access any time.</p><form method=post action="/authorize/decision"><input type=hidden name=pending value="${escHtml(pid)}"><input type=hidden name=csrf value="${escHtml(sess.csrfToken)}"><button class=a name=decision value=approve>Allow</button><button class=d name=decision value=deny>Deny</button></form></div>`;
       return send(res, 200, html);
     }
     if (p === "/authorize/decision" && m === "POST") {
@@ -147,6 +162,11 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
     }
     if (p === "/revoke" && m === "POST") return sendHandler(res, auth.revoke(parseForm(await readBody(req, 20_000))));
 
+    // ---- Guest login (no GitHub app, no keys) ----
+    if (p === "/auth/guest" && m === "POST") {
+      const g = guestLogin(req); if ("error" in g) return send(res, g.status, { error: g.error });
+      return send(res, 200, { ok: true }, { "set-cookie": g.cookie });
+    }
     // ---- GitHub login ----
     if (p === "/auth/github/login" && m === "GET") {
       if (!config.githubClientId) return send(res, 500, "<h1>GITHUB_CLIENT_ID is not configured</h1>");
