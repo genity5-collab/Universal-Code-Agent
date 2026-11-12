@@ -1,0 +1,24 @@
+# One-click deploy: https://render.com/deploy?repo=https://github.com/genity5-collab/Universal-Code-Agent
+services:
+  - type: web
+    name: universal-code-agent
+    runtime: docker
+    plan: starter            # a persistent disk needs a paid plan (see docs/render.md for the free option)
+    healthCheckPath: /healthz
+    autoDeploy: true
+    disk:
+      name: uca-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: GITHUB_CLIENT_ID
+        sync: false          # you paste this once in the Render dashboard
+      - key: GITHUB_CLIENT_SECRET
+        sync: false
+      - key: UCA_SESSION_SECRET
+        generateValue: true  # Render creates a strong random secret for you
+      - key: UCA_PERSISTENT
+        value: "true"
+      - key: UCA_DATA_DIR
+        value: /data
+      # UCA_BASE_URL is detected automatically from Render's RENDER_EXTERNAL_URL

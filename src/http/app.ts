@@ -9,6 +9,7 @@ import { SessionManager, parseCookies } from "../auth/session.js";
 import { GithubTokenVault } from "../auth/tokenvault.js";
 import * as GHO from "../github/oauth.js";
 import { GitHubClient } from "../github/client.js";
+import { CodespacesClient } from "../github/codespaces.js";
 import { buildMcpServer, allTools } from "../mcp/server.js";
 import { CodespaceBroker } from "../codespace/broker.js";
 import { ApprovalService, AuditLog, RateLimiter } from "../mcp/services.js";
@@ -87,6 +88,22 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
     if (p === "/.well-known/oauth-authorization-server") return sendHandler(res, auth.metadata());
     if (p === "/.well-known/oauth-protected-resource" || p === "/.well-known/oauth-protected-resource/mcp") return sendHandler(res, auth.protectedResourceMetadata());
     if (p === "/healthz") return send(res, 200, { ok: true });
+
+
+    // ---- first-run setup wizard (public; shows only booleans and the URLs you must paste into GitHub) ----
+    if (p === "/api/setup-status" && m === "GET") {
+      const needsHttps = !config.baseUrl.startsWith("https://") && !/^http:\/\/(localhost|127\.0\.0\.1)/.test(config.baseUrl);
+      return send(res, 200, {
+        baseUrl: config.baseUrl, mcpUrl: `${config.baseUrl}/mcp`, callbackUrl: `${config.baseUrl}/auth/github/callback`,
+        githubConfigured: !!(config.githubClientId && config.githubClientSecret), https: config.baseUrl.startsWith("https://"), needsHttps,
+        persistent: process.env.UCA_PERSISTENT === "true",
+        newOAuthAppUrl: "https://github.com/settings/applications/new",
+      });
+    }
+    if (p === "/setup" && m === "GET") {
+      const f = path.resolve(webDir, "setup.html");
+      if (fs.existsSync(f)) { res.writeHead(200, { ...secHeaders, "content-type": MIME[".html"], "cache-control": "no-cache" }); return void res.end(fs.readFileSync(f)); }
+    }
 
     // ---- OAuth 2.1 endpoints ----
     if (p === "/register" && m === "POST") {
@@ -267,6 +284,21 @@ echo "UCA agent started. Log: $DIR/agent.log"
       }
       if (route === "/jobs") return send(res, 200, { jobs: R.listJobs(ctx.workspaceRoot).map((j) => ({ id: j.jobId, command: j.command, status: j.status, exitCode: j.exitCode })) });
       if ((mm = /^\/jobs\/([^/]+)\/output$/.exec(route))) { const o: any = R.jobOutput(mm[1], 0, 65536, ctx.workspaceRoot); return send(res, 200, { stdout: redact(o.content ?? o.output ?? ""), stderr: "", truncated: !o.eof }); }
+      if (route === "/codespaces" && m === "GET") {
+        let list: any[] = []; let ghError: string | undefined;
+        try { const r: any = await new CodespacesClient(ghc()).listCodespaces(); list = (r.items ?? r.codespaces ?? r) as any[]; } catch (e: any) { ghError = redact(String(e?.message ?? e)); }
+        const agents = broker.list(ctx.userId);
+        const names = new Set<string>([...list.map((c: any) => c.name), ...agents.map((a) => a.codespace)]);
+        return send(res, 200, { ghError, codespaces: [...names].map((n) => { const c = list.find((x: any) => x.name === n); const a = agents.find((x) => x.codespace === n); return { name: n, repo: c?.repository?.fullName ?? c?.repository?.full_name ?? c?.repo ?? null, state: c?.state ?? null, machine: c?.machine?.displayName ?? c?.machine ?? null, paired: !!a, online: !!a?.online, lastSeen: a?.lastSeen ?? null }; }) });
+      }
+      if ((mm = /^\/codespaces\/([A-Za-z0-9._-]+)\/attach$/.exec(route)) && m === "POST") {
+        const { claim, expiresAt } = broker.createClaim(ctx.userId, mm[1]);
+        return send(res, 200, { command: `curl -fsSL ${config.baseUrl}/agent/install.sh | UCA_SERVER=${config.baseUrl} UCA_CLAIM=${claim} bash`, expiresAt });
+      }
+      if ((mm = /^\/codespaces\/([A-Za-z0-9._-]+)\/detach$/.exec(route)) && m === "POST") return send(res, 200, { detached: broker.unpair(ctx.userId, mm[1]) });
+      if ((mm = /^\/codespaces\/([A-Za-z0-9._-]+)\/(start|stop)$/.exec(route)) && m === "POST") {
+        const c = new CodespacesClient(ghc()); const r: any = mm[2] === "start" ? await c.startCodespace(mm[1]) : await c.stopCodespace(mm[1]); return send(res, 200, { ok: true, state: r?.state ?? null });
+      }
       if (route === "/approvals") return send(res, 200, { approvals: approvals.list(ctx.userId) });
       if ((mm = /^\/approvals\/([^/]+)\/(approve|deny)$/.exec(route)) && m === "POST") return send(res, approvals.decide(ctx.userId, mm[1], mm[2] === "approve") ? 200 : 404, { ok: true });
       if (route === "/grants") return send(res, 200, { grants: auth.listGrants(ctx.userId) });

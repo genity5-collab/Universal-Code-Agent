@@ -26,7 +26,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const port = Number(env.PORT ?? 8787);
   return {
     port,
-    baseUrl: (env.UCA_BASE_URL ?? `http://localhost:${port}`).replace(/\/$/, ""),
+    baseUrl: (env.UCA_BASE_URL || env.RENDER_EXTERNAL_URL || (env.RAILWAY_PUBLIC_DOMAIN ? `https://${env.RAILWAY_PUBLIC_DOMAIN}` : "") || (env.FLY_APP_NAME ? `https://${env.FLY_APP_NAME}.fly.dev` : "") || `http://localhost:${port}`).replace(/\/$/, ""),
     dataDir,
     workspacesDir: path.resolve(env.UCA_WORKSPACES_DIR ?? path.join(dataDir, "workspaces")),
     githubClientId: env.GITHUB_CLIENT_ID ?? "",

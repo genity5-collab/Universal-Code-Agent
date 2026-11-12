@@ -19,12 +19,25 @@ async function boot() {
   try { const m = await api("/me"); state.me = m.user; state.csrf = m.csrf; setConn(true); }
   catch { state.me = null; setConn(false); }
   document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => go(b.dataset.tab)));
-  go("repos"); pollApprovals(); setInterval(pollApprovals, 8000);
+  if (!state.me) { try { const st = await (await fetch("/api/setup-status")).json(); if (!st.githubConfigured) { location.replace("/setup"); return; } } catch {} }
+  const want = new URLSearchParams(location.search).get("tab");
+  go(["repos", "editor", "tasks", "terminal", "codespaces", "approvals", "settings"].includes(want) ? want : "repos"); pollApprovals(); setInterval(pollApprovals, 8000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) pollApprovals(); });
+  registerPwa();
+}
+function registerPwa() {
+  if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost")) navigator.serviceWorker.register("/sw.js").catch(() => {});
+  const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone;
+  if (standalone || localStorage.getItem("uca-install-dismissed")) return;
+  const banner = $("#banner"); const ios = /iphone|ipad|ipod/i.test(navigator.userAgent);
+  const show = (html, onAction) => { banner.hidden = false; banner.innerHTML = html + `<button class="btn sec" id="bx" aria-label="Dismiss">&times;</button>`; $("#bx").onclick = () => { banner.hidden = true; localStorage.setItem("uca-install-dismissed", "1"); }; if (onAction) onAction(); };
+  window.addEventListener("beforeinstallprompt", (e) => { e.preventDefault(); show(`<span class="grow">Install this app on your phone</span><button class="btn" id="bi">Install</button>`, () => { $("#bi").onclick = async () => { e.prompt(); await e.userChoice.catch(() => {}); banner.hidden = true; }; }); });
+  if (ios) show(`<span class="grow" style="font-size:14px">Install: tap <b>Share</b>, then <b>Add to Home Screen</b></span>`);
 }
 function go(tab) {
   state.tab = tab;
   document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
-  ({ repos, editor, tasks, terminal, approvals, settings }[tab])();
+  ({ repos, editor, tasks, terminal, codespaces, approvals, settings }[tab])();
 }
 function needLogin() {
   view.innerHTML = `<div class="card"><h2>Connect GitHub</h2><p class="muted">Sign in with your own GitHub account. No AI API keys are needed or stored.</p><a class="btn" style="display:inline-block;text-decoration:none;padding:12px 16px;border-radius:10px;background:var(--accent);color:#fff" href="/auth/github/login">Sign in with GitHub</a></div>`;
@@ -104,6 +117,34 @@ async function approvals() {
 async function pollApprovals() {
   if (!state.me) return;
   try { const d = await api("/approvals"); const n = (d.approvals || []).filter((a) => a.status === "pending").length; const b = $("#badge"); b.hidden = n === 0; b.textContent = n; setConn(true); } catch { setConn(false); }
+}
+
+async function codespaces() {
+  if (!state.me) return needLogin();
+  view.innerHTML = `<h2>Cloud Linux VM (Codespaces)</h2><p class="muted" style="margin:0 4px 8px">Let the AI run commands, edit files and use git inside a real Linux Codespace.</p><div id="cs" class="muted"><span class="spin"></span> Loading...</div>`;
+  const draw = async () => {
+    let d; try { d = await api("/codespaces"); } catch (e) { $("#cs").innerHTML = `<div class="card err">${esc(e.message)}</div>`; return; }
+    const list = d.codespaces || [];
+    $("#cs").classList.remove("muted");
+    $("#cs").innerHTML = (d.ghError ? `<div class="card err">GitHub said: ${esc(d.ghError)}<br><span class="muted">Sign out and in again to grant the Codespaces permission.</span></div>` : "") +
+      (list.map((c) => `<div class="card" data-n="${esc(c.name)}"><div class="row"><span class="dot ${c.online ? "on" : ""}"></span><b class="grow" style="overflow:hidden;text-overflow:ellipsis">${esc(c.name)}</b><span class="tag">${esc(c.state || (c.online ? "Available" : "unknown"))}</span></div>
+        <div class="muted" style="font-size:13px;margin:4px 0 8px">${esc(c.repo || "")} ${c.paired ? (c.online ? "&middot; AI agent online" : "&middot; paired, agent offline") : "&middot; not connected to AI yet"}</div>
+        <div class="row wrap">${c.paired ? `<button class="btn sec" data-a="detach">Disconnect</button>` : ""}<button class="btn" data-a="attach">${c.paired && !c.online ? "Reconnect" : c.paired ? "Re-pair" : "Connect to AI"}</button>
+        ${c.state === "Shutdown" || c.state === "Stopped" ? `<button class="btn sec" data-a="start">Start</button>` : c.state === "Available" ? `<button class="btn sec" data-a="stop">Stop</button>` : ""}</div><div class="out"></div></div>`).join("") || `<div class="card muted">No Codespaces found. Create one on github.com/codespaces, or ask your AI to call <code>codespaces_create</code>.</div>`);
+  };
+  await draw();
+  $("#cs").onclick = async (e) => {
+    const a = e.target.dataset.a; const card = e.target.closest("[data-n]"); if (!a || !card) return; const n = card.dataset.n; const out = $(".out", card); e.target.disabled = true;
+    try {
+      if (a === "attach") {
+        const r = await api(`/codespaces/${encodeURIComponent(n)}/attach`, { method: "POST", body: {} });
+        out.innerHTML = `<p class="muted" style="font-size:13px">Open this Codespace's terminal, paste this once (valid 10 min, single use):</p><div class="copy"><code>${esc(r.command)}</code><button class="btn sec" data-copy>Copy</button></div>`;
+        out.querySelector("[data-copy]").onclick = async (ev) => { try { await navigator.clipboard.writeText(r.command); ev.target.textContent = "Copied"; } catch { ev.target.textContent = "Press and hold the text to copy"; } };
+        const t0 = Date.now(); const poll = setInterval(async () => { if (Date.now() - t0 > 600000 || !document.contains(out)) return clearInterval(poll); try { const d = await api("/codespaces"); if ((d.codespaces || []).find((c) => c.name === n && c.online)) { clearInterval(poll); draw(); } } catch {} }, 3000);
+      } else { await api(`/codespaces/${encodeURIComponent(n)}/${a}`, { method: "POST", body: {} }); if (a === "start" || a === "stop") setTimeout(draw, 1500); else draw(); }
+    } catch (err) { out.innerHTML = `<span class="err">${esc(err.message)}</span>`; }
+    e.target.disabled = false;
+  };
 }
 async function settings() {
   if (!state.me) return needLogin();

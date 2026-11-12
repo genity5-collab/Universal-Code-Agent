@@ -14,7 +14,11 @@ UCA server over HTTPS, long-polling for jobs. No inbound ports, no tunnels.
 AI (Claude / ChatGPT / Gemini) --MCP--> UCA server --job queue--> uca-agent (in Codespace) --> bash, files, git
 ```
 
-## Setup (about one minute)
+## Setup from your phone (easiest)
+
+Open the app, tap the **Cloud** tab, pick a Codespace and tap **Connect to AI**. It shows one command with a Copy button. Paste it once into the Codespace terminal. The row turns green when the agent is online. The same tab can start and stop the Codespace and disconnect the agent.
+
+## Setup through the AI (about one minute)
 
 1. Create or pick a Codespace (`codespaces_create`, or any you already have). Make sure it is running (`codespaces_start`).
 2. Ask the AI to call **`codespaces_attach`** with the Codespace name. It returns one command, valid for 10 minutes.

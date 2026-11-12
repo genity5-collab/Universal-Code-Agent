@@ -1,3 +1,5 @@
+> **Easiest path: [Deploy on Render](render.md)** (one click, guided `/setup` wizard, installable on your phone).
+
 # Deploying
 
 Requirements: Node 20+, a public HTTPS URL, a GitHub OAuth App.
