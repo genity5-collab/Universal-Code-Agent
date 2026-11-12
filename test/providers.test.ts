@@ -538,3 +538,11 @@ test("chooser: when BOTH GitHub and guest are enabled, /authorize offers a choic
     try { assert.equal((await fetch(`${off.base}/authorize/choose?pending=${pending}`)).status, 400); assert.equal((await fetch(`${off.base}/authorize/guest`, { method: "POST", body: new URLSearchParams({ pending }) })).status, 400); } finally { await off.stop(); }
   } finally { await c.stop(); }
 });
+
+test("InstaBox preset is listed first, pins api.instabox.sh and sends X-API-Key (never Authorization)", async () => {
+  const { PRESETS } = await import("../src/providers/vault.js");
+  const p = PRESETS.find((x) => x.id === "instabox")!;
+  assert.ok(p, "instabox preset exists"); assert.equal(PRESETS[0].id, "instabox");
+  assert.deepEqual(p.hosts, ["api.instabox.sh"]); assert.deepEqual(p.auth, { type: "header", name: "X-API-Key" });
+  assert.equal(new URL(p.verify!.url).host, "api.instabox.sh");
+});

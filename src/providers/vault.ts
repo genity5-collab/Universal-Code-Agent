@@ -29,6 +29,7 @@ export interface ProviderSpec {
 
 /** Recommended presets. These are starting points; the user can still add any provider by hand. */
 export const PRESETS: ProviderSpec[] = [
+  { id: "instabox", label: "InstaBox VM", hosts: ["api.instabox.sh"], auth: { type: "header", name: "X-API-Key" }, docsUrl: "https://instabox.sh/docs/api-reference/introduction", verify: { url: "https://api.instabox.sh/v1/machines?limit=1" }, recommended: true, note: "Instant Linux VMs for the AI. Create a key at dashboard.instabox.sh with machines:read, machines:write, machines:delete." },
   { id: "flyio", label: "Fly.io Machines", hosts: ["api.machines.dev", "api.fly.io"], auth: { type: "bearer" }, docsUrl: "https://fly.io/docs/machines/api/", verify: { url: "https://api.machines.dev/v1/apps?org_slug=personal" }, recommended: true, note: "Real Linux microVMs." },
   { id: "digitalocean", label: "DigitalOcean Droplets", hosts: ["api.digitalocean.com"], auth: { type: "bearer" }, docsUrl: "https://docs.digitalocean.com/reference/api/", verify: { url: "https://api.digitalocean.com/v2/account" }, recommended: true, note: "Full Linux servers." },
   { id: "hetzner", label: "Hetzner Cloud", hosts: ["api.hetzner.cloud"], auth: { type: "bearer" }, docsUrl: "https://docs.hetzner.cloud/", verify: { url: "https://api.hetzner.cloud/v1/servers?per_page=1" }, recommended: true, note: "Cheap Linux servers." },
