@@ -220,7 +220,6 @@ export class AuthorizationServer {
       token_endpoint: `${b}/oauth/token`,
       registration_endpoint: `${b}/oauth/register`,
       revocation_endpoint: `${b}/oauth/revoke`,
-      introspection_endpoint: `${b}/oauth/introspect`,
       response_types_supported: ["code"],
       grant_types_supported: ["authorization_code", "refresh_token"],
       token_endpoint_auth_methods_supported: ["none", "client_secret_post", "client_secret_basic"],

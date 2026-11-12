@@ -96,10 +96,22 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
 
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", config.baseUrl);
-    const p = url.pathname; const m = req.method ?? "GET";
+    // Discovery advertises /oauth/<endpoint>; the handlers below are mounted at /<endpoint>. Serve both so no client gets a 404.
+    const p = /^\/oauth\/(register|authorize|token|revoke)$/.test(url.pathname) ? url.pathname.slice(6) : url.pathname; const m = req.method ?? "GET";
+
+    // ---- CORS for the PUBLIC protocol endpoints only (browser-based MCP clients). Never for the cookie-authenticated dashboard /api. ----
+    const isProtocolPath = p.startsWith("/.well-known/") || p === "/register" || p === "/token" || p === "/revoke" || p === "/mcp";
+    if (isProtocolPath) {
+      res.setHeader("access-control-allow-origin", "*");
+      res.setHeader("access-control-allow-methods", "GET, POST, DELETE, OPTIONS");
+      res.setHeader("access-control-allow-headers", "authorization, content-type, mcp-protocol-version, mcp-session-id, accept, last-event-id");
+      res.setHeader("access-control-expose-headers", "www-authenticate, mcp-session-id");
+      res.setHeader("access-control-max-age", "600");
+      if (m === "OPTIONS") { res.writeHead(204); return void res.end(); }
+    }
 
     // ---- discovery ----
-    if (p === "/.well-known/oauth-authorization-server") return sendHandler(res, auth.metadata());
+    if (p === "/.well-known/oauth-authorization-server" || p === "/.well-known/oauth-authorization-server/mcp" || p === "/.well-known/openid-configuration" || p === "/.well-known/openid-configuration/mcp" || p === "/mcp/.well-known/openid-configuration") return sendHandler(res, auth.metadata());
     if (p === "/.well-known/oauth-protected-resource" || p === "/.well-known/oauth-protected-resource/mcp") return sendHandler(res, auth.protectedResourceMetadata());
     if (p === "/healthz") return send(res, 200, { ok: true });
 

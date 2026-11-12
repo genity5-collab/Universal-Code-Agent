@@ -456,3 +456,55 @@ test("guest safety: dangerous commands are blocked or need approval for guests t
     await client.close();
   } finally { await c.stop(); }
 });
+
+test("REAL-CLIENT DISCOVERY: a client that follows only the URLs the server advertises (as ChatGPT does) can register, authorize, get a token and call tools", async () => {
+  const c = await bootGuest();
+  try {
+    // 1) unauthenticated MCP call -> 401 with resource_metadata pointer
+    const r0 = await fetch(`${c.base}/mcp`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "x", version: "1" } } }) });
+    assert.equal(r0.status, 401); const rm = /resource_metadata="([^"]+)"/.exec(r0.headers.get("www-authenticate") ?? ""); assert.ok(rm, "401 must carry resource_metadata");
+    const prm = await (await fetch(rm![1])).json() as any; assert.ok(prm.authorization_servers?.[0]);
+    // 2) discovery - try every well-known location real clients probe; all must answer
+    const as = prm.authorization_servers[0];
+    for (const w of ["/.well-known/oauth-authorization-server", "/.well-known/oauth-authorization-server/mcp", "/.well-known/openid-configuration", "/.well-known/oauth-protected-resource/mcp"]) assert.equal((await fetch(as + w)).status, 200, w);
+    const meta = await (await fetch(`${as}/.well-known/oauth-authorization-server`)).json() as any;
+    // 3) EVERY endpoint the metadata advertises must exist (not 404)
+    for (const k of ["authorization_endpoint", "token_endpoint", "registration_endpoint", "revocation_endpoint"]) {
+      assert.ok(meta[k], k + " advertised"); const probe = await fetch(meta[k], { method: k === "authorization_endpoint" ? "GET" : "POST", headers: { "content-type": "application/json" }, body: k === "authorization_endpoint" ? undefined : "{}", redirect: "manual" });
+      assert.notEqual(probe.status, 404, `${k} (${meta[k]}) is advertised but returns 404`); assert.notEqual(probe.status, 405, `${k} wrong method`);
+    }
+    assert.ok(!("introspection_endpoint" in meta), "do not advertise endpoints that are not mounted");
+    // 4) full flow using ONLY advertised URLs, with ChatGPT's real redirect URI
+    const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
+    const reg = await fetch(meta.registration_endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "ChatGPT", redirect_uris: [redirectUri], token_endpoint_auth_method: "none", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }) }); assert.equal(reg.status, 201, await reg.clone().text()); const client_id = ((await reg.json()) as any).client_id;
+    const { verifier, challenge } = pkce();
+    const q = new URLSearchParams({ response_type: "code", client_id, redirect_uri: redirectUri, code_challenge: challenge, code_challenge_method: "S256", scope: "mcp:read mcp:write mcp:exec", state: "xyz", resource: prm.resource });
+    const a1 = await fetch(`${meta.authorization_endpoint}?${q}`, { redirect: "manual" }); assert.equal(a1.status, 302, "authorize: " + a1.status);
+    const cookie = a1.headers.getSetCookie().map((x) => x.split(";")[0]).join("; ");
+    const page = await (await fetch(new URL(a1.headers.get("location")!, c.base), { headers: { cookie } })).text();
+    const csrf = /name=csrf value="([^"]+)"/.exec(page)![1]; const pending = /name=pending value="([^"]+)"/.exec(page)![1];
+    const dec = await fetch(`${c.base}/authorize/decision`, { method: "POST", redirect: "manual", headers: { cookie, "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ pending, csrf, decision: "approve" }) });
+    const back = new URL(dec.headers.get("location")!); assert.equal(back.origin + back.pathname, redirectUri); assert.equal(back.searchParams.get("state"), "xyz"); const code = back.searchParams.get("code")!; assert.ok(code);
+    const tr = await fetch(meta.token_endpoint, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: redirectUri, client_id, code_verifier: verifier, resource: prm.resource }) }); const tok = await tr.json() as any; assert.ok(tok.access_token, JSON.stringify(tok));
+    // 5) token works on the advertised resource
+    const mc = await mcpClient({ base: c.base } as any, tok.access_token); const tools = await mc.listTools(); assert.ok(tools.tools.length > 40, "tools listed: " + tools.tools.length); await mc.close();
+    // 6) the same flow via the OLD un-prefixed paths still works (backward compatible)
+    assert.equal((await fetch(`${c.base}/register`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ redirect_uris: [redirectUri], token_endpoint_auth_method: "none" }) })).status, 201);
+  } finally { await c.stop(); }
+});
+
+test("CORS: public protocol endpoints answer browser preflights; the cookie-authenticated dashboard API never does", async () => {
+  const c = await bootGuest();
+  try {
+    for (const [pth, method] of [["/.well-known/oauth-authorization-server", "GET"], ["/register", "POST"], ["/token", "POST"], ["/mcp", "POST"]] as const) {
+      const r = await fetch(c.base + pth, { method: "OPTIONS", headers: { origin: "https://inspector.example", "access-control-request-method": method, "access-control-request-headers": "authorization,content-type,mcp-protocol-version" } });
+      assert.equal(r.status, 204, pth); assert.equal(r.headers.get("access-control-allow-origin"), "*", pth); assert.match(r.headers.get("access-control-allow-headers") ?? "", /authorization/i, pth);
+    }
+    const d = await fetch(`${c.base}/.well-known/oauth-authorization-server`, { headers: { origin: "https://x.example" } }); assert.equal(d.headers.get("access-control-allow-origin"), "*");
+    const u = await fetch(`${c.base}/mcp`, { method: "POST", headers: { origin: "https://x.example", "content-type": "application/json" }, body: "{}" }); assert.equal(u.status, 401); assert.match(u.headers.get("access-control-expose-headers") ?? "", /www-authenticate/i, "browser clients must be able to read WWW-Authenticate");
+    // dashboard API: no CORS, so another website cannot drive a signed-in user's session
+    const api = await fetch(`${c.base}/api/me`, { method: "OPTIONS", headers: { origin: "https://evil.example", "access-control-request-method": "POST" } }); assert.equal(api.headers.get("access-control-allow-origin"), null, "dashboard API must not be CORS-enabled");
+    const api2 = await fetch(`${c.base}/api/me`, { headers: { origin: "https://evil.example" } }); assert.equal(api2.headers.get("access-control-allow-origin"), null);
+    const g = await fetch(`${c.base}/auth/guest`, { method: "OPTIONS", headers: { origin: "https://evil.example" } }); assert.equal(g.headers.get("access-control-allow-origin"), null, "guest login must not be cross-origin callable");
+  } finally { await c.stop(); }
+});
