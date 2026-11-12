@@ -30,6 +30,11 @@ Connect your AI: see [Claude Code](docs/platforms/claude-code.md), [ChatGPT](doc
 
 Local stdio: `claude mcp add universal-code-agent -- node dist/src/cli.js stdio` (uses `GITHUB_TOKEN` from env).
 
+## Other VM providers (Fly.io, DigitalOcean, Hetzner, Render, Freestyle, any)
+
+Paste a provider API key in the app (Cloud tab, Provider keys). It is kept in server memory only, never reaches the AI, and is wiped when you sign out.
+Your AI then searches that provider's docs and learns how to use it. Writes need your approval. See [docs/providers.md](docs/providers.md).
+
 ## Honest limitations
 - **Not a VM.** Commands run as the server's OS user in a per-user directory with an allowlist policy, no shell, and a scrubbed environment. For untrusted multi-user hosting, run it inside a container or VM, or use Codespaces.
 - **Codespaces** uses your GitHub quota and billing. Running commands inside a Codespace is not exposed by GitHub's public REST API; the tool returns the `gh codespace ssh` command instead.

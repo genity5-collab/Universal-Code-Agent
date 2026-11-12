@@ -119,9 +119,41 @@ async function pollApprovals() {
   try { const d = await api("/approvals"); const n = (d.approvals || []).filter((a) => a.status === "pending").length; const b = $("#badge"); b.hidden = n === 0; b.textContent = n; setConn(true); } catch { setConn(false); }
 }
 
+
+async function providerKeys(host) {
+  host.innerHTML = `<div class="card"><b>Provider keys (other VMs)</b><p class="muted" style="font-size:13px;margin:4px 0 8px">Paste a key here, <b>not in the chat</b>. It is kept only in this server's memory. It is never saved to disk and your AI never sees it. It is wiped when you sign out, revoke access or the server restarts. Once added, your AI searches that provider's docs to learn how to use it.</p><div id="pk" class="muted"><span class="spin"></span></div></div>`;
+  const draw = async () => {
+    let d; try { d = await api("/providers"); } catch (e) { $("#pk").innerHTML = `<span class="err">${esc(e.message)}</span>`; return; }
+    $("#pk").classList.remove("muted");
+    const have = new Set((d.added || []).map((a) => a.id));
+    $("#pk").innerHTML =
+      ((d.added || []).map((a) => `<div class="item" style="cursor:default" data-id="${esc(a.id)}"><div class="n"><span class="dot on"></span>${esc(a.label)}<br><small>${esc(a.hosts.join(", "))} &middot; key #${esc(a.fingerprint)}</small></div><span class="row"><button class="btn sec" data-v="${esc(a.id)}">Test</button><button class="btn bad" data-r="${esc(a.id)}">Forget</button></span></div><div class="muted" data-m="${esc(a.id)}" style="font-size:13px;padding:0 4px"></div>`).join("") || `<p class="muted">No provider keys added.</p>`) +
+      `<form id="pf" autocomplete="off" style="margin-top:10px"><label class="muted" style="font-size:13px">Provider</label>
+        <select id="ps"><option value="">Choose a recommended provider...</option>${(d.presets || []).filter((p) => !have.has(p.id)).map((p) => `<option value="${esc(p.id)}">${esc(p.label)}${p.note ? " - " + esc(p.note) : ""}</option>`).join("")}<option value="__other">Other (type any provider)</option></select>
+        <div id="oth" hidden><input id="pl" placeholder="Provider name, e.g. Vultr" maxlength="60" style="margin-top:8px"><input id="ph" placeholder="API hostname, e.g. api.vultr.com" style="margin-top:8px" autocapitalize="off" autocorrect="off" spellcheck="false"><p class="muted" style="font-size:12px;margin:4px 0">Your key will only ever be sent to this hostname.</p></div>
+        <input id="pkey" type="password" placeholder="Paste API key" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false" style="margin-top:8px">
+        <button class="btn" style="margin-top:8px;width:100%" type="submit">Add key (memory only)</button><div id="pmsg" style="margin-top:6px"></div></form>`;
+    $("#ps").onchange = (e) => { $("#oth").hidden = e.target.value !== "__other"; };
+    $("#pf").onsubmit = async (e) => {
+      e.preventDefault(); const sel = $("#ps").value; const msg = $("#pmsg"); if (!sel) { msg.innerHTML = `<span class="err">Choose a provider.</span>`; return; }
+      const body = { key: $("#pkey").value };
+      if (sel === "__other") { body.label = $("#pl").value; body.hosts = [$("#ph").value]; } else body.id = sel;
+      $("#pkey").value = ""; // clear the secret from the page immediately
+      try { const r = await api("/providers", { method: "POST", body }); msg.innerHTML = `<span style="color:var(--ok)">Added ${esc(r.label)}. Tell your AI: "I added ${esc(r.label)}, learn how to use it."</span>`; setTimeout(draw, 900); }
+      catch (err) { msg.innerHTML = `<span class="err">${esc(err.message)}</span>`; }
+    };
+  };
+  await draw();
+  $("#pk").onclick = async (e) => {
+    const r = e.target.dataset.r, v = e.target.dataset.v;
+    if (r && confirm("Forget this key now?")) { await api(`/providers/${encodeURIComponent(r)}`, { method: "DELETE" }); draw(); }
+    if (v) { const m = $(`[data-m="${v}"]`); m.textContent = "Testing..."; try { const x = await api(`/providers/${encodeURIComponent(v)}/verify`, { method: "POST", body: {} }); m.innerHTML = x.ok === true ? `<span style="color:var(--ok)">Key works (HTTP ${x.status}).</span>` : x.ok === false ? `<span class="err">Rejected${x.status ? " (HTTP " + x.status + ")" : ""}${x.message ? ": " + esc(x.message) : ""}</span>` : esc(x.message); } catch (err) { m.innerHTML = `<span class="err">${esc(err.message)}</span>`; } }
+  };
+}
 async function codespaces() {
   if (!state.me) return needLogin();
-  view.innerHTML = `<h2>Cloud Linux VM (Codespaces)</h2><p class="muted" style="margin:0 4px 8px">Let the AI run commands, edit files and use git inside a real Linux Codespace.</p><div id="cs" class="muted"><span class="spin"></span> Loading...</div>`;
+  view.innerHTML = `<h2>Cloud Linux VM (Codespaces)</h2><p class="muted" style="margin:0 4px 8px">Let the AI run commands, edit files and use git inside a real Linux Codespace.</p><div id="cs" class="muted"><span class="spin"></span> Loading...</div><div id="pkh"></div>`;
+  providerKeys($("#pkh"));
   const draw = async () => {
     let d; try { d = await api("/codespaces"); } catch (e) { $("#cs").innerHTML = `<div class="card err">${esc(e.message)}</div>`; return; }
     const list = d.codespaces || [];

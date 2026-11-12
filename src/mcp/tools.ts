@@ -17,6 +17,7 @@ import type { ApprovalService, AuditLog, RateLimiter } from "./services.js";
 export type ToolScope = "mcp:read" | "mcp:write" | "mcp:exec";
 export interface ToolDeps {
   broker?: import("../codespace/broker.js").CodespaceBroker;
+  vault?: import("../providers/vault.js").ProviderVault;
   publicBaseUrl?: string;
   config: Config;
   approvals: ApprovalService;
@@ -266,15 +267,15 @@ export async function runTool(def: ToolDef, args: unknown, ctx: UserContext, dep
     if (!parsed.success) return fail(`Invalid arguments: ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`);
     const out = await def.handler(parsed.data, ctx, deps);
     deps.audit.write({ userId: ctx.userId, tool: def.name, ok: true });
-    return ok(JSON.parse(redact(JSON.stringify(out ?? null))));
+    return ok(JSON.parse(deps.vault ? deps.vault.scrubAll(ctx.userId, redact(JSON.stringify(out ?? null))) : redact(JSON.stringify(out ?? null))));
   } catch (e: any) {
     if (e instanceof ApprovalNeeded) {
       deps.audit.write({ userId: ctx.userId, tool: def.name, ok: false, note: "approval_required" });
       return { content: [{ type: "text", text: JSON.stringify({ status: "approval_required", approvalId: e.approvalId, action: e.action, message: "A human must approve this in the dashboard (Approvals tab). Ask the user to approve, then call this tool again with the same arguments. Do not try to work around it." }) }], isError: true };
     }
     if (e instanceof R.ApprovalRequiredError) return fail(`approval_required: ${e.message}`);
-    deps.audit.write({ userId: ctx.userId, tool: def.name, ok: false, note: String(e?.message ?? e) });
+    deps.audit.write({ userId: ctx.userId, tool: def.name, ok: false, note: deps.vault ? deps.vault.scrubAll(ctx.userId, String(e?.message ?? e)) : String(e?.message ?? e) });
     const msg = e instanceof GitHubError || e instanceof SecurityError || e instanceof Error ? e.message : String(e);
-    return fail(redact(msg));
+    return fail(deps.vault ? deps.vault.scrubAll(ctx.userId, redact(msg)) : redact(msg));
   }
 }

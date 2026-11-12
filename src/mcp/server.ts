@@ -2,9 +2,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UserContext } from "../types.js";
 import { TOOLS, runTool, type ToolDeps, type ToolScope } from "./tools.js";
 import { CS_TOOLS } from "../codespace/tools.js";
+import { PROVIDER_TOOLS } from "../providers/tools.js";
 
 /** All tools: core + Codespace tools (the latter only when the server has a broker). */
-export function allTools(deps: ToolDeps) { return deps.broker ? [...TOOLS, ...CS_TOOLS] : TOOLS; }
+export function allTools(deps: ToolDeps) { return [...TOOLS, ...(deps.broker ? CS_TOOLS : []), ...((deps as any).vault ? PROVIDER_TOOLS : [])]; }
 
 /** Build an MCP server exposing only the tools the caller's granted scopes allow. */
 export function buildMcpServer(ctx: UserContext, deps: ToolDeps, scopes: string[]): McpServer {

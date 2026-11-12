@@ -12,6 +12,8 @@ import { GitHubClient } from "../github/client.js";
 import { CodespacesClient } from "../github/codespaces.js";
 import { buildMcpServer, allTools } from "../mcp/server.js";
 import { CodespaceBroker } from "../codespace/broker.js";
+import { ProviderVault, PRESETS, validateHost, VaultError, type ProviderSpec } from "../providers/vault.js";
+import { fetchPublicDoc } from "../providers/docs.js";
 import { ApprovalService, AuditLog, RateLimiter } from "../mcp/services.js";
 import { type ToolDeps } from "../mcp/tools.js";
 import * as R from "../exec/runner.js";
@@ -23,7 +25,7 @@ const WEB_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.
 const MIME: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".webmanifest": "application/manifest+json", ".svg": "image/svg+xml" };
 
 export interface AppOptions { githubApiBase?: string; githubWebBase?: string; fetchImpl?: typeof fetch; webDir?: string }
-export interface App { broker: CodespaceBroker; server: http.Server; auth: AuthorizationServer; sessions: SessionManager; approvals: ApprovalService; deps: ToolDeps; close(): Promise<void> }
+export interface App { pvault: ProviderVault; broker: CodespaceBroker; server: http.Server; auth: AuthorizationServer; sessions: SessionManager; approvals: ApprovalService; deps: ToolDeps; close(): Promise<void> }
 
 function readBody(req: http.IncomingMessage, limit = 2_000_000): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -45,7 +47,8 @@ export function createApp(config: Config, opts: AppOptions = {}): App {
   const audit = new AuditLog(config.dataDir);
   const limiter = new RateLimiter(config.rateLimitPerMin);
   const broker = new CodespaceBroker();
-  const deps: ToolDeps = { broker, publicBaseUrl: config.baseUrl, config, approvals, audit, limiter, githubBaseUrl: opts.githubApiBase, fetchImpl: opts.fetchImpl };
+  const pvault = new ProviderVault();
+  const deps: ToolDeps = { vault: pvault, broker, publicBaseUrl: config.baseUrl, config, approvals, audit, limiter, githubBaseUrl: opts.githubApiBase, fetchImpl: opts.fetchImpl };
   const secure = config.baseUrl.startsWith("https://");
   const fetchImpl = opts.fetchImpl ?? fetch;
   const webDir = opts.webDir ?? WEB_DIR;
@@ -262,7 +265,7 @@ echo "UCA agent started. Log: $DIR/agent.log"
     const ghc = () => { if (!ctx.githubToken) throw Object.assign(new Error("GitHub not connected"), { status: 400 }); return new GitHubClient(ctx.githubToken, { baseUrl: opts.githubApiBase, fetchImpl }); };
     try {
       if (route === "/me") return send(res, 200, { user: { login: pr.login, userId: pr.userId }, csrf: pr.csrfToken });
-      if (route === "/logout" && m === "POST") { const clear = sessions.destroySession(parseCookies(req.headers.cookie)); return send(res, 200, { ok: true }, { "set-cookie": clear }); }
+      if (route === "/logout" && m === "POST") { pvault.clearUser(ctx.userId); const clear = sessions.destroySession(parseCookies(req.headers.cookie)); return send(res, 200, { ok: true }, { "set-cookie": clear }); }
       if (route === "/repos") { const r: any = await ghc().listRepos("all", undefined, 1, 100, 300); return send(res, 200, { repos: (r.items ?? r).map((x: any) => ({ full_name: x.fullName ?? x.full_name, description: x.description, private: x.private })) }); }
       let mm: RegExpExecArray | null;
       if ((mm = /^\/repos\/([^/]+)\/([^/]+)\/contents$/.exec(route))) {
@@ -299,16 +302,37 @@ echo "UCA agent started. Log: $DIR/agent.log"
       if ((mm = /^\/codespaces\/([A-Za-z0-9._-]+)\/(start|stop)$/.exec(route)) && m === "POST") {
         const c = new CodespacesClient(ghc()); const r: any = mm[2] === "start" ? await c.startCodespace(mm[1]) : await c.stopCodespace(mm[1]); return send(res, 200, { ok: true, state: r?.state ?? null });
       }
+      // ---- provider keys: the USER pastes a key here (never in chat). Memory only. The AI never sees it. ----
+      if (route === "/providers" && m === "GET") {
+        const mine = pvault.list(ctx.userId);
+        return send(res, 200, { added: mine.map((k) => ({ id: k.spec.id, label: k.spec.label, hosts: k.spec.hosts, docsUrl: k.spec.docsUrl ?? null, fingerprint: k.fingerprint, addedAt: k.addedAt })), presets: PRESETS.map((p) => ({ id: p.id, label: p.label, hosts: p.hosts, docsUrl: p.docsUrl, note: p.note })), storage: "memory-only" });
+      }
+      if (route === "/providers" && m === "POST") {
+        let b: any; try { b = JSON.parse((await readBody(req, 20_000)) || "{}"); } catch { return send(res, 400, { error: "Invalid JSON" }); } const preset = PRESETS.find((p) => p.id === String(b.id ?? "").toLowerCase());
+        try {
+          const hosts = Array.isArray(b.hosts) ? b.hosts.map(String) : preset?.hosts ?? [];
+          const rawId = String(b.id ?? "").toLowerCase().trim() || String(b.label ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32);
+          const spec: ProviderSpec = { id: rawId, label: String(b.label || preset?.label || rawId).slice(0, 60), hosts: hosts.map((h: string) => validateHost(h)), auth: preset?.auth ?? (b.authHeader ? { type: "header", name: String(b.authHeader).replace(/[^A-Za-z0-9-]/g, "").slice(0, 40) } : { type: "bearer" }), docsUrl: preset?.docsUrl ?? (typeof b.docsUrl === "string" && b.docsUrl.startsWith("https://") ? b.docsUrl.slice(0, 500) : undefined) };
+          const k = pvault.put(ctx.userId, spec, String(b.key ?? ""));
+          return send(res, 200, { ok: true, id: k.spec.id, label: k.spec.label, hosts: k.spec.hosts, fingerprint: k.fingerprint, storage: "memory-only", next: "Tell your AI the provider is added. It will search the docs and learn how to use it." });
+        } catch (e: any) { if (e instanceof VaultError) return send(res, 400, { error: e.message }); throw e; }
+      }
+      if ((mm = /^\/providers\/([a-z0-9-]{2,32})$/.exec(route)) && m === "DELETE") return send(res, 200, { removed: pvault.remove(ctx.userId, mm[1]) });
+      if ((mm = /^\/providers\/([a-z0-9-]{2,32})\/verify$/.exec(route)) && m === "POST") {
+        const spec = PRESETS.find((p) => p.id === mm![1]); if (!spec?.verify) return send(res, 200, { ok: null, message: "No automatic check for this provider. Your AI will test it when it first uses it." });
+        try { const r = await pvault.request(ctx.userId, mm[1], { url: spec.verify.url }, fetchImpl); return send(res, 200, { ok: r.status >= 200 && r.status < 300, status: r.status }); }
+        catch (e: any) { return send(res, 200, { ok: false, message: String(e?.message ?? e).slice(0, 200) }); }
+      }
       if (route === "/approvals") return send(res, 200, { approvals: approvals.list(ctx.userId) });
       if ((mm = /^\/approvals\/([^/]+)\/(approve|deny)$/.exec(route)) && m === "POST") return send(res, approvals.decide(ctx.userId, mm[1], mm[2] === "approve") ? 200 : 404, { ok: true });
       if (route === "/grants") return send(res, 200, { grants: auth.listGrants(ctx.userId) });
       if ((mm = /^\/grants\/([^/]+)\/revoke$/.exec(route)) && m === "POST") return send(res, 200, { revoked: auth.revokeGrant(ctx.userId, decodeURIComponent(mm[1])) });
-      if (route === "/revoke-all" && m === "POST") return send(res, 200, { revoked: auth.revokeAllForUser(ctx.userId) });
+      if (route === "/revoke-all" && m === "POST") { pvault.clearUser(ctx.userId); return send(res, 200, { revoked: auth.revokeAllForUser(ctx.userId) }); }
       if (route === "/tools") return send(res, 200, { tools: allTools(deps).map((t) => ({ name: t.name, scope: t.scope, description: t.description })) });
       return send(res, 404, { error: "not_found" });
     } catch (e: any) { return send(res, e?.status && e.status < 600 ? e.status : 500, { error: redact(String(e?.message ?? e)) }); }
   }
 
   const server = http.createServer((req, res) => { handle(req, res).catch((e: any) => { if (!res.headersSent) send(res, e?.status ?? 500, { error: redact(String(e?.message ?? "internal_error")) }); else res.end(); }); });
-  return { broker, server, auth, sessions, approvals, deps, close: () => new Promise<void>((r) => server.close(() => r())) };
+  return { pvault, broker, server, auth, sessions, approvals, deps, close: () => new Promise<void>((r) => { const t = setTimeout(r, 3000); t.unref?.(); server.close(() => { clearTimeout(t); r(); }); (server as any).closeIdleConnections?.(); setTimeout(() => (server as any).closeAllConnections?.(), 1000).unref?.(); }) };
 }
