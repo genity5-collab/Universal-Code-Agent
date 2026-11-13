@@ -38,7 +38,7 @@ export function needsHumanInVm(pol: { decision: string; reason?: string; argv?: 
   return DELETE_REASON.test(pol.reason ?? "");
 }
 
-export const GATED_TOOLS = new Set(["read_file","read_file_chunk","read_file_range","write_file","create_file","edit_file","delete_file","list_directory","search_files","search_content","find_symbol","get_file_metadata","compare_files","index_repo","repo_map","dependency_map","change_tracking","run_command","start_job","job_status","job_output","stop_job","list_jobs","read_command_log","install_dependencies","run_tests","format_code","static_analysis","build_verify","git_status","git_diff","git_log","git_branch_create","git_checkout","git_commit","git_clone","git_push","git_pull"]);
+export const GATED_TOOLS = new Set(["upload_part","finish_upload","read_file_slice","read_file","read_file_chunk","read_file_range","write_file","create_file","edit_file","delete_file","list_directory","search_files","search_content","find_symbol","get_file_metadata","compare_files","index_repo","repo_map","dependency_map","change_tracking","run_command","start_job","job_status","job_output","stop_job","list_jobs","read_command_log","install_dependencies","run_tests","format_code","static_analysis","build_verify","git_status","git_diff","git_log","git_branch_create","git_checkout","git_commit","git_clone","git_push","git_pull"]);
 
 type H = (a: any, ctx: UserContext, deps: ToolDeps, vm: VmEnv) => Promise<unknown>;
 export interface VmEnv { mgr: InstaBoxManager; feed: ActivityFeed }
@@ -150,3 +150,6 @@ Object.assign(VM_HANDLERS, {
 function jobId(v: unknown): string { const s = String(v ?? ""); if (!/^j[a-z0-9]{4,20}$/.test(s)) throw new Error("Invalid job id."); return s; }
 
 export function missingHandlers(): string[] { return [...GATED_TOOLS].filter((n) => !VM_HANDLERS[n]); }
+
+import { BIG_HANDLERS } from "./bigfiles.js";
+Object.assign(VM_HANDLERS, BIG_HANDLERS); // bigfiles reads tools.ts exports only inside functions, so this cycle is safe

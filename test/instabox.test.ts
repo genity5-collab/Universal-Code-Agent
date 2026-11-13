@@ -62,7 +62,7 @@ test("every VM handler only reads arguments its tool actually declares (catches 
   const byName = new Map(TOOLS.map((t) => [t.name, t]));
   for (const name of GATED_TOOLS) {
     const declared = new Set(Object.keys(byName.get(name)!.shape)); const src = VM_HANDLERS[name].toString();
-    const used = new Set([...src.matchAll(/\ba\.([A-Za-z_]+)/g)].map((m) => m[1]));
+    const used = new Set([...src.matchAll(/\ba\.([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]));
     for (const u of used) if (!declared.has(u)) assert.fail(`${name}: handler reads a.${u} but the tool only declares: ${[...declared].join(", ") || "(nothing)"}`);
   }
 });

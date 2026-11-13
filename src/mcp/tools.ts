@@ -50,7 +50,7 @@ async function getIndex(root: string): Promise<RepoIndex> {
   if (!idx) { idx = new RepoIndex(root); await idx.load(); indexes.set(root, idx); }
   return idx;
 }
-function gh(ctx: UserContext, deps: ToolDeps): GitHubClient {
+export function gh(ctx: UserContext, deps: ToolDeps): GitHubClient {
   if (!ctx.githubToken) throw new Error(ctx.userId.startsWith("guest:") ? "GitHub features are off in guest mode. Files, commands, git on local folders and cloud VM providers still work. The server owner can enable GitHub sign-in to turn these on." : "GitHub is not connected for this user. Sign in at the dashboard.");
   return new GitHubClient(ctx.githubToken, { baseUrl: deps.githubBaseUrl, fetchImpl: deps.fetchImpl });
 }
@@ -60,7 +60,7 @@ function cs(ctx: UserContext, deps: ToolDeps): CodespacesClient { return new Cod
 export class ApprovalNeeded extends Error {
   constructor(public approvalId: string, public action: string) { super(`approval_required: ${action}`); }
 }
-function needApproval(ctx: UserContext, deps: ToolDeps, action: string, detail: string): void {
+export function needApproval(ctx: UserContext, deps: ToolDeps, action: string, detail: string): void {
   if (!deps.config.requireApproval) return;
   const r = deps.approvals.check(ctx.userId, action, detail);
   if (r.state === "approved") return;
@@ -73,6 +73,12 @@ const p = z.string().min(1).describe("Path relative to the workspace root");
 const page = { page: z.number().int().min(1).optional(), perPage: z.number().int().min(1).max(100).optional() };
 
 export const TOOLS: ToolDef[] = [
+  { name: "upload_part", title: "Upload one part of a large file", description: "Send one part (base64, up to 8 MB) of a large file into the VM. Use the same uploadId for all parts and an increasing index (0,1,2...). Then call finish_upload. No overall size limit except the 1 GB workspace.", scope: "mcp:write", readOnly: false,
+    shape: { uploadId: z.string(), index: z.number().int().min(0).max(1_000_000), dataBase64: z.string().min(1) }, handler: async () => { throw new NoVmError(); } },
+  { name: "finish_upload", title: "Finish a large upload", description: "Assemble the uploaded parts into the file at path. Give the whole file's sha256 so a damaged or incomplete upload never replaces a good file.", scope: "mcp:write", readOnly: false,
+    shape: { uploadId: z.string(), path: z.string().min(1).max(1000), sha256: z.string().regex(/^[A-Fa-f0-9]{64}$/).optional(), parts: z.number().int().min(1).optional() }, handler: async () => { throw new NoVmError(); } },
+  { name: "read_file_slice", title: "Read a slice of any file", description: "Read up to 4 MB of any file in the VM as base64, starting at offset. Works for binary files of any size; follow nextOffset until eof.", scope: "mcp:read", readOnly: true,
+    shape: { path: z.string().min(1).max(1000), offset: z.number().int().min(0).optional(), size: z.number().int().min(1).max(4 * 1048576).optional() }, handler: async () => { throw new NoVmError(); } },
   // ---------------- filesystem ----------------
   { name: "read_file", title: "Read file", description: "Read a whole file. For large files returns requiresChunking instead of truncating; then use read_file_chunk or read_file_range.", scope: "mcp:read", readOnly: true,
     shape: { path: p, maxBytes: z.number().int().positive().optional() }, handler: (a, c) => F.read_file(c.workspaceRoot, a.path, { maxBytes: a.maxBytes }) },

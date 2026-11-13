@@ -1,3 +1,4 @@
+import { GITHUB_EXTRA_TOOLS } from "../github/extratools.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UserContext } from "../types.js";
 import { TOOLS, runTool, type ToolDeps, type ToolScope } from "./tools.js";
@@ -8,7 +9,7 @@ import { DESKTOP_TOOLS } from "../instabox/desktop.js";
 import { LIVE_TOOLS, LIVE_HTML, LIVE_URI, LIVE_MIME } from "../instabox/livewindow.js";
 
 /** All tools: core + Codespace tools (the latter only when the server has a broker). */
-export function allTools(deps: ToolDeps) { return [...TOOLS, ...(deps.broker ? CS_TOOLS : []), ...((deps as any).vault ? PROVIDER_TOOLS : []), ...(deps.vm ? [...VM_TOOLS, ...LIVE_TOOLS, ...DESKTOP_TOOLS] : [])]; }
+export function allTools(deps: ToolDeps) { return [...TOOLS, ...GITHUB_EXTRA_TOOLS, ...(deps.broker ? CS_TOOLS : []), ...((deps as any).vault ? PROVIDER_TOOLS : []), ...(deps.vm ? [...VM_TOOLS, ...LIVE_TOOLS, ...DESKTOP_TOOLS] : [])]; }
 
 /** Build an MCP server exposing only the tools the caller's granted scopes allow. */
 export function buildMcpServer(ctx: UserContext, deps: ToolDeps, scopes: string[]): McpServer {
